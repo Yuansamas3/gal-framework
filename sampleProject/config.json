@@ -1,0 +1,59 @@
+{
+  "project_name": "sampleProject",
+  "profile": "modern_acg",
+  "guideline": "zh_light_novel_v2.md",
+  "project_guideline": "project_guideline.md",
+  "charter": "00_agent_charter.md",
+  "target_lang": "zh-cn",
+  "target_encoding": "utf8",
+  "source_format": "gt_json",
+  "input_dir": "gt_input",
+  "cache_dir": "transl_cache",
+  "output_dir": "gt_output",
+  "history_file": "cache_history.jsonl",
+  "preserve_presets": [
+    "base",
+    "kag"
+  ],
+  "ruby_preserve_mode": "translate",
+  "strip_outer_quotes": true,
+  "align_trailing_period": true,
+  "extra_linebreak_policy": "warn",
+  "linebreak_symbol": "auto",
+  "sort_dicts": true,
+  "use_pre_dict_in_name": false,
+  "use_gpt_dict_in_name": true,
+  "use_post_dict_in_name": false,
+  "pre_dicts": [
+    "builtin:pre_h_phonetic.tsv",
+    "builtin:pre_common.tsv",
+    "project:项目字典_译前.tsv"
+  ],
+  "gpt_dicts": [
+    "builtin:gpt_common_acg.tsv",
+    "builtin:gpt_common_menu.tsv",
+    "project:项目GPT字典.tsv"
+  ],
+  "post_dicts": [
+    "builtin:post_symbol_common.tsv",
+    "project:项目字典_译后.tsv"
+  ],
+  "batch_size": 40,
+  "context_num": 8,
+  "avg_sentence_length_threshold": 18,
+  "length_ratio_threshold": 1.3,
+  "length_diff_threshold": 4,
+  "strict_length_check": false,
+  "retransl_fail": false,
+  "retransl_keys": [
+    "翻译失败"
+  ],
+  "enable_organ_injection_check": true,
+  "enable_register_check": true,
+  "speaker_map": {
+    "遥": "遥",
+    "蓮": "莲",
+    "琴音": "琴音",
+    "遥・琴音": "遥·琴音"
+  }
+}

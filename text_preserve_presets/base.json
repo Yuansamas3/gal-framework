@@ -1,0 +1,36 @@
+[
+  {
+    "src": "<br\\s*/?>",
+    "info": "HTML/引擎换行标签 <br>"
+  },
+  {
+    "src": "%\\d+;",
+    "info": "引擎数值变量标记 %123;"
+  },
+  {
+    "src": "%(?:\\([^)\\r\\n]+\\))?[-#0+]*(?:\\d+|\\*)?(?:\\.(?:\\d+|\\*))?[diouxXeEfFgGcrs%]",
+    "info": "格式化占位符 %s %02d %(name)s %%"
+  },
+  {
+    "src": "\\{[A-Za-z_][A-Za-z0-9_.:-]*\\}",
+    "info": "命名占位符 {player_name}"
+  },
+  {
+    "src": "\\{\\d+\\}",
+    "info": "编号占位符 {0} {1}"
+  },
+  {
+    "src": "</?(?:size|color|font|b|i|u|align|indent|scale|speed|wait)(?:=[^>\\r\\n]*)?>",
+    "info": "富文本样式标签 <size=30> </size> <color=#fff>"
+  },
+  {
+    "src": "<r[^>\\r\\n]+>|</r>",
+    "info": "BGI/通用注音标签 <r读音>正文</r>",
+    "is_ruby": true
+  },
+  {
+    "src": "<ruby[^>\\r\\n]*>|</ruby>|<rt[^>\\r\\n]*>|</rt>|<rb[^>\\r\\n]*>|</rb>",
+    "info": "HTML Ruby 注音标签",
+    "is_ruby": true
+  }
+]
