@@ -9,7 +9,7 @@ from .dictionary import NormalDict
 from .models import ProjectConfig, SentenceItem
 from .text_preserve import PLACEHOLDER_RE, TextPreserver
 
-_TRAILING_PLACEHOLDERS_RE = re.compile(r"(?:\ue000[\ue010-\ue01f]+\ue001)+$")
+_TRAILING_PLACEHOLDERS_RE = re.compile(f"(?:{PLACEHOLDER_RE.pattern})+$")
 
 _QUOTE_PAIRS: dict[str, str] = {
     "「": "」",

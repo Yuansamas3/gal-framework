@@ -15,9 +15,9 @@
   - **`--session <id>` 记忆去重锁**：首锅注入完整 `<project_bible>` 底色卡，同会话后续批次自动缩减为 2 行 `BibleHash` 指纹提醒（若中途修改底色卡则哈希变化自动重发），消除多轮重复上下文膨胀。
   - **按文件分组极简协议**：支持 `## @file: <name>` 分组输入与 `@@ file: <name>` + `<id>|<译文>` 单行补丁提交（同时 100% 兼容传统 `@@ file|id` + `+译文`、JSON 数组与 JSONL），直接削减 60%~75% I/O Token。
   - **带防绕过熔断的 `batch-push --pull-next`**：`0` 硬错误且单锅软告警未超标时一步返回下一锅未译文本；一旦检出硬错误或软告警飙升（`>8%`），立即熔断刹车（含 GBK 非法字符防崩延迟导出与跨轮未修债追踪），仅吐回问题条目要求原地修绿。
-- **确定性剥壳/扣壳与 PUA 私用区控制符保护 (`core/normalizer.py` + `core/text_preserve.py`)**
+- **确定性剥壳/扣壳与非字符区随机密钥哨兵保护 (`core/normalizer.py` + `core/text_preserve.py`)**
   - 幂等剥离外层空白/换行及单行、嵌套、跨 2~3 条目连续对话引号（`「…」`/`『…』`）。
-  - 采用 Unicode 私用区（PUA）无碰撞哨兵编码，`protect_text(include_ruby=True)` 全程免疫任意译后字典误改并罩住标点对齐（支持句尾控制符前标点对齐）。
+  - 采用 Unicode 永久非字符区（`U+FDD0–U+FDEF`）+ 进程级随机 4-nibble 密钥哨兵，`protect_text(include_ruby=True)` 同时免疫译后字典误改与日系引擎 BMP 私用区外字（如 ExHIBIT `U+E08A`）碰撞，并全程罩住句尾控制符前的标点对齐。
   - 内置 `base` / `kag` / `scn_m2` / `renpy` / `rpgmaker` / `wolf` 六套安全控制符预设，支持 `translate` / `verbatim` / `flexible` 三种 Ruby 注音模式。
 - **三级条件字典与单字人名构词防误伤 (`core/dictionary.py` + `core/glossary_tools.py`)**
   - 完整支持 `pre_dict`、`gpt_dict`、`post_dict` 前缀修饰（`^^` 句首、`1^` 仅首现）与条件语法（`pre_jp`/`post_jp`/`pre_dst` + `[and]`/`[or]`/`!` + `(同上)`）。
@@ -55,7 +55,51 @@ gal_framework/
 ├── adapters/                          # 双向无损格式适配器 (gt_json / compact_pipe)
 ├── sampleProject/                     # 标准可运行全链路验收样板工程
 ├── skills/gal-framework/SKILL.md      # AI Agent 六阶省流本地化操作手册
-└── tests/test_framework.py            # 24 项全模块与端到端单元测试套件
+└── tests/test_framework.py            # 39 项全模块与端到端回归测试套件
+```
+
+---
+
+## 快速上手（Quickstart：零依赖走通全链路）
+
+仅需 **Python 3.10+**（纯标准库，无需 `pip install` 任何第三方包）。以下命令使用仓库自带的 `sampleProject/gt_input` 演示从建项到导出的完整闭环：
+
+```bash
+# 1. 初始化全新三分离工程（启用基础与 KAG 控制符保护）
+python gal_cli.py init --project ./demo_proj --profile modern_acg --preserve base,kag
+
+# 2. 导入源剧本至只读 gt_input/（支持 gt_json 或 compact_pipe）
+python gal_cli.py import --project ./demo_proj --format gt_json --input ./sampleProject/gt_input
+
+# 3. 拉取首锅紧凑工作包（--session 自动开启多轮底色卡去重）
+python gal_cli.py batch-pull --project ./demo_proj --session w1 --batch-size 5
+
+# 4. 写入前 5 条紧凑译文补丁（外层「」与句尾 ♪ 会由框架自动对齐还原）
+cat << 'EOF' > ./demo_proj/work/patch_01.txt
+@@ file: chapter_01.json
+1|莲，早上好
+2|喂喂，马上就要迟到了啊
+3|因为昨晚在看《银狼》的新刊嘛
+4|今天天气这么好
+5|去天台吃午饭吧
+EOF
+
+# Windows PowerShell 可改用：
+# @"
+# @@ file: chapter_01.json
+# 1|莲，早上好
+# 2|喂喂，马上就要迟到了啊
+# 3|因为昨晚在看《银狼》的新刊嘛
+# 4|今天天气这么好
+# 5|去天台吃午饭吧
+# "@ | Set-Content -Encoding UTF8 ./demo_proj/work/patch_01.txt
+
+# 5. 推送补丁、执行增量质检并一步拉取下一锅（0 硬错误自动放行翻页）
+python gal_cli.py batch-push --project ./demo_proj --patch-file ./demo_proj/work/patch_01.txt --session w1 --pull-next --batch-size 5
+
+# 6. 查看工程进度与质检状态，并导出成品至 gt_output/（未全部翻完时加 --allow-incomplete 预览）
+python gal_cli.py status --project ./demo_proj
+python gal_cli.py export --project ./demo_proj --format gt_json --output ./demo_proj/gt_output --allow-incomplete
 ```
 
 ---

@@ -1518,14 +1518,36 @@ class TestSecurityAndEdgeCaseAuditFixes(unittest.TestCase):
             it_ov = SentenceItem("s.json", 1, pre_src="a~b", post_src="a~b", pre_dst="a~b")
             self.assertEqual(normalize_and_restore_dst(it_ov, cfg_ov, post_dict=loaded_post), "a~b")
 
-    def test_h5_pua_placeholders_immune_to_tp_post_dict(self) -> None:
-        cfg = ProjectConfig(preserve_presets=["base"])
+    def test_h5_noncharacter_randomized_sentinels_immune_to_post_dict_and_exhibit_pua_gaiji(self) -> None:
+        from core.text_preserve import PLACEHOLDER_RE, _SENTINEL_KEY, _make_sentinel_placeholder
+
+        # Sentinel must strictly reside in Unicode permanent noncharacters U+FDD0..U+FDEF with 4-nibble key
+        sample_ph = _make_sentinel_placeholder(0)
+        self.assertTrue(all(0xFDD0 <= ord(ch) <= 0xFDEF for ch in sample_ph))
+        self.assertEqual(len(_SENTINEL_KEY), 4)
+        self.assertIsNotNone(PLACEHOLDER_RE.fullmatch(sample_ph))
+        # Forged sentinel with wrong key or BMP PUA Gaiji (e.g. ExHIBIT U+E08A, U+E000..U+E01F) must NOT match
+        forged_nc = "\ufdd0" + ("\ufde0" if _SENTINEL_KEY[0] != "\ufde0" else "\ufde1") + _SENTINEL_KEY[1:] + "\ufde0\ufdd1"
+        self.assertIsNone(PLACEHOLDER_RE.search(forged_nc))
+        self.assertIsNone(PLACEHOLDER_RE.search("\ue000\ue010\ue001\ue08a"))
+
+        cfg = ProjectConfig(preserve_presets=["base", "kag"])
         tp = TextPreserver.from_project(cfg)
         pd = NormalDict()
         pd.load_tsv_text("TP\t技力\n")
-        it = SentenceItem("s.json", 1, pre_src="「<color=#fff>テスト</color>」", pre_dst="<color=#fff>TP回复</color>", speaker="遥")
+        # ExHIBIT PUA Gaiji U+E08A + legacy PUA U+E000 sequence inside prose must survive intact alongside tags
+        it = SentenceItem(
+            "s.json",
+            1,
+            pre_src="「<color=#fff>テスト</color>\ue08a\ue000\ue010\ue001[l]」",
+            pre_dst="<color=#fff>TP回复</color>\ue08a\ue000\ue010\ue001。[l]",
+            speaker="遥",
+        )
         strip_outer_shell([it])
-        self.assertEqual(normalize_and_restore_dst(it, cfg, post_dict=pd, preserver=tp), "「<color=#fff>技力回复</color>」")
+        self.assertEqual(
+            normalize_and_restore_dst(it, cfg, post_dict=pd, preserver=tp),
+            "「<color=#fff>技力回复</color>\ue08a\ue000\ue010\ue001[l]」",
+        )
 
     def test_h6_presets_and_ruby_kana_leak_detection(self) -> None:
         tp_base = TextPreserver.from_project(ProjectConfig(preserve_presets=["base"]))

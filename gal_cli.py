@@ -74,7 +74,13 @@ def _emit(payload: dict[str, Any], fmt: str, md_text: str, output_path: str | No
         p.write_text(rendered + "\n", encoding="utf-8")
         print(f"Written output to: {p}")
     else:
-        print(rendered)
+        try:
+            print(rendered)
+            sys.stdout.flush()
+        except BrokenPipeError:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
 
 
 def _project_dict_path(config: ProjectConfig, project_dir: Path, kind: str) -> Path:

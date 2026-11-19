@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,17 +22,20 @@ _JS_UNICODE_SCRIPT_MAP: dict[str, str] = {
 _CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]")
 _CJK_PROSE_PUNCT_RE = re.compile(r"[。！？、，；：]")
 
-_PUA_START = "\ue000"
-_PUA_END = "\ue001"
-_PUA_HEX = tuple(chr(0xE010 + i) for i in range(16))
-PLACEHOLDER_RE = re.compile(r"\ue000[\ue010-\ue01f]+\ue001")
+# Unicode permanent noncharacters (U+FDD0..U+FDEF, Unicode Standard §23.7) + per-process
+# random 4-nibble key: immune to both post_dict text rules AND Japanese engine PUA Gaiji (U+E000..U+F8FF).
+_NC_START = "\ufdd0"
+_NC_END = "\ufdd1"
+_NC_HEX = tuple(chr(0xFDE0 + i) for i in range(16))
+_SENTINEL_KEY = "".join(_NC_HEX[int(ch, 16)] for ch in secrets.token_hex(2))
+PLACEHOLDER_RE = re.compile(rf"\ufdd0{re.escape(_SENTINEL_KEY)}[\ufde0-\ufdef]+\ufdd1")
 _ZERO_LEN_PROBES: tuple[str, ...] = ("", "a", "あ", "测试")
 
 
-def _make_pua_placeholder(idx: int) -> str:
-    """Encode an integer token index purely inside Unicode Private Use Area (immune to post_dict)."""
-    digits = "".join(_PUA_HEX[int(ch, 16)] for ch in f"{idx:x}")
-    return f"{_PUA_START}{digits}{_PUA_END}"
+def _make_sentinel_placeholder(idx: int) -> str:
+    """Encode a token index using U+FDD0..U+FDEF noncharacters gated by a per-run random key."""
+    digits = "".join(_NC_HEX[int(ch, 16)] for ch in f"{idx:x}")
+    return f"{_NC_START}{_SENTINEL_KEY}{digits}{_NC_END}"
 
 
 def normalize_regex_pattern(pattern: str) -> str:
@@ -463,7 +467,7 @@ class TextPreserver:
             if sp.start > last:
                 parts.append(text[last : sp.start])
             while True:
-                placeholder = _make_pua_placeholder(idx)
+                placeholder = _make_sentinel_placeholder(idx)
                 idx += 1
                 if placeholder not in text and placeholder not in token_map:
                     break

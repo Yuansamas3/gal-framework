@@ -11,7 +11,7 @@ from typing import Any, Iterable, Sequence
 from .models import ProjectConfig, SentenceItem
 from .text_preserve import PLACEHOLDER_RE, TextPreserver
 
-_PLACEHOLDER_SPLIT_RE = re.compile(r"(\ue000[\ue010-\ue01f]+\ue001)")
+_PLACEHOLDER_SPLIT_RE = re.compile(f"({PLACEHOLDER_RE.pattern})")
 
 _VALID_COND_TYPES: dict[str, str] = {
     "pre_jp": "pre_src",
@@ -330,7 +330,7 @@ class NormalDict:
 
     @staticmethod
     def _apply_rule_safe(working: str, rule: NormalDictRule, has_placeholders: bool) -> str:
-        """Apply a single rule while never mutating PUA control/ruby placeholders."""
+        """Apply a single rule while never mutating noncharacter control/ruby sentinels."""
         if not has_placeholders:
             if rule.is_regex and rule._compiled is not None:
                 return rule._compiled.sub(rule.replace, working, count=1 if rule.replace_once else 0)
