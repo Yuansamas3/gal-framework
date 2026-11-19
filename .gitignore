@@ -2,9 +2,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.tmp
+*.lock
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
 Thumbs.db
 work/.sessions/
+work/seeds.json
+cache_history.jsonl

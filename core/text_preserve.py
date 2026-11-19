@@ -21,13 +21,57 @@ _JS_UNICODE_SCRIPT_MAP: dict[str, str] = {
 _CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]")
 _CJK_PROSE_PUNCT_RE = re.compile(r"[。！？、，；：]")
 
+_PUA_START = "\ue000"
+_PUA_END = "\ue001"
+_PUA_HEX = tuple(chr(0xE010 + i) for i in range(16))
+PLACEHOLDER_RE = re.compile(r"\ue000[\ue010-\ue01f]+\ue001")
+_ZERO_LEN_PROBES: tuple[str, ...] = ("", "a", "あ", "测试")
+
+
+def _make_pua_placeholder(idx: int) -> str:
+    """Encode an integer token index purely inside Unicode Private Use Area (immune to post_dict)."""
+    digits = "".join(_PUA_HEX[int(ch, 16)] for ch in f"{idx:x}")
+    return f"{_PUA_START}{digits}{_PUA_END}"
+
 
 def normalize_regex_pattern(pattern: str) -> str:
-    """Adapt common JS Unicode script escapes so Python stdlib `re` compiles them."""
-    out = pattern
-    for js_tok, py_range in _JS_UNICODE_SCRIPT_MAP.items():
-        out = out.replace(js_tok, py_range)
-    return out
+    """Adapt common JS Unicode script escapes so Python stdlib `re` compiles them safely."""
+    out: list[str] = []
+    in_class = False
+    i = 0
+    n = len(pattern)
+    while i < n:
+        matched_js = False
+        if pattern[i] == "\\":
+            for js_tok, py_range in _JS_UNICODE_SCRIPT_MAP.items():
+                if pattern.startswith(js_tok, i):
+                    out.append(py_range if in_class else f"[{py_range}]")
+                    i += len(js_tok)
+                    matched_js = True
+                    break
+            if matched_js:
+                continue
+            if i + 1 < n:
+                out.append(pattern[i : i + 2])
+                i += 2
+                continue
+        ch = pattern[i]
+        if ch == "[" and not in_class:
+            in_class = True
+            out.append(ch)
+            i += 1
+            if i < n and pattern[i] == "^":
+                out.append("^")
+                i += 1
+            if i < n and pattern[i] == "]":
+                out.append("]")
+                i += 1
+            continue
+        if ch == "]" and in_class:
+            in_class = False
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 @dataclass
@@ -176,19 +220,20 @@ def validate_rule(
 def _ruby_envelope_kind(tag: str) -> str:
     """Classify the structural envelope of a ruby tag so tag kind parity can be checked in translate mode."""
     t = tag.strip()
-    if t.startswith("</"):
-        return t.lower()
-    if t.startswith("<r") and not t.lower().startswith(("<ruby", "<rt", "<rb")):
+    tl = t.lower()
+    if tl.startswith("</"):
+        return tl
+    if tl.startswith("<r") and not tl.startswith(("<ruby", "<rt", "<rb")):
         return "<r...>"
-    if t.lower().startswith("<ruby"):
+    if tl.startswith("<ruby"):
         return "<ruby>"
-    if t.lower().startswith("<rt"):
+    if tl.startswith("<rt"):
         return "<rt>"
-    if t.lower().startswith("<rb"):
+    if tl.startswith("<rb"):
         return "<rb>"
-    if t.lower().startswith("[ruby"):
+    if tl.startswith("[ruby"):
         return "[ruby ...]"
-    if t.lower().startswith(r"\r["):
+    if tl.startswith(r"\r["):
         return r"\r[...]"
     return "ruby_tag"
 
@@ -215,17 +260,24 @@ class TextPreserver:
                 )
             )
             return False
-        if enforce_safe and rule.compiled.search("") is not None:
-            self.rejected_rules.append(
-                RuleAuditResult(
-                    src=rule.src,
-                    info=rule.info,
-                    valid=False,
-                    errors=["zero-length match on empty string"],
-                    zero_length_count=1,
+        if enforce_safe:
+            zero_hits = 0
+            for probe in _ZERO_LEN_PROBES:
+                for m in rule.compiled.finditer(probe):
+                    if m.end() == m.start():
+                        zero_hits += 1
+                        break
+            if zero_hits > 0:
+                self.rejected_rules.append(
+                    RuleAuditResult(
+                        src=rule.src,
+                        info=rule.info,
+                        valid=False,
+                        errors=[f"zero-length match detected ({zero_hits} probe hit(s))"],
+                        zero_length_count=zero_hits,
+                    )
                 )
-            )
-            return False
+                return False
         self.rules.append(rule)
         return True
 
@@ -411,7 +463,7 @@ class TextPreserver:
             if sp.start > last:
                 parts.append(text[last : sp.start])
             while True:
-                placeholder = f"\u27eaTP{idx}\u27eb"
+                placeholder = _make_pua_placeholder(idx)
                 idx += 1
                 if placeholder not in text and placeholder not in token_map:
                     break
@@ -483,7 +535,7 @@ class TextPreserver:
                 if diff > 0:
                     ruby_extra.extend([tok] * diff)
         elif mode == "flexible":
-            # Flexible ruby mode (e.g. M2 PSB `[・]` emphasis dots or per-char `[セ]２[カ]度[ン]目[ド]` furigana):
+            # Flexible ruby mode (e.g. M2 PSB `[・]` emphasis dots or per-char `[ほ]星[し]空` furigana):
             # allows natural dropping/merging of source ruby in Chinese while forbidding newly invented ruby when src had none.
             if not src_ruby and dst_ruby:
                 ruby_extra.extend(_ruby_envelope_kind(sp.text) for sp in dst_ruby)

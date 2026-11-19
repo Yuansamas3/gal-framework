@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import json
 import shutil
@@ -21,18 +22,30 @@ from unittest.mock import patch
 import gal_cli
 from adapters import compact_pipe, gt_json
 from core import batcher as batcher_mod
-from core.batcher import edit_cache_entries, parse_patch_text, pull_batch, push_batch
+from core.batcher import (
+    _render_src_for_prompt,
+    edit_cache_entries,
+    parse_patch_text,
+    pull_batch,
+    push_batch,
+    search_replace_project,
+)
 from core.cache_ledger import (
     MISS_KEY_NOT_FOUND,
     MISS_POST_SRC_CHANGED,
+    cache_file_path_for,
     cleanup_stale_cache_temp_files,
     join_input_with_cache,
+    load_cache_entries,
+    load_project_files,
+    save_input_file,
 )
 from core.dictionary import (
     GptDict,
     GptDictEntry,
     NormalDict,
     inject_glossary_for_batch,
+    load_project_dicts,
 )
 from core.glossary_tools import audit_variant_inconsistency, sample_character_debuts
 from core.models import ItemStatus, ProjectConfig, SentenceItem
@@ -45,8 +58,9 @@ from core.problems import (
     problem_severity,
     split_problems_by_severity,
 )
+from core.rebuilder import export_project_outputs, rebuild_project, revert_task
 from core.seed_ledger import SeedLedger
-from core.text_preserve import TextPreserver, validate_rule
+from core.text_preserve import PreserveRule, TextPreserver, normalize_regex_pattern, validate_rule
 
 
 def _run_cli(argv: list[str]) -> tuple[int, str]:
@@ -1224,6 +1238,518 @@ class TestV2EfficiencyAndTwoTierQA(unittest.TestCase):
             rc_st, md_st = _run_cli(["status", "--project", str(proj)])
             self.assertEqual(rc_st, 0)
             self.assertIn("Open QA: **0** item(s) (**0** hard errors, **0** warnings", md_st)
+
+
+class TestSecurityAndEdgeCaseAuditFixes(unittest.TestCase):
+    """Regression suite pinning all C-1..C-4, H-1..H-7, M-1..M-5, and L-1..L-3 audit fixes."""
+
+    def test_c1_windows_concurrent_cross_file_and_same_file_locking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1) Cross-file concurrent push_batch + pull_batch must never delete active temps or raise WinError
+            proj = Path(tmp) / "conc_cross"
+            cfg = ProjectConfig(project_name="conc_cross")
+            cfg.save(proj)
+            for fidx in range(4):
+                fname = f"sc0{fidx}.json"
+                save_input_file(
+                    proj,
+                    cfg,
+                    fname,
+                    [SentenceItem(fname, i, pre_src=f"「テスト{fidx}_{i}」", speaker=f"S{fidx}") for i in range(1, 41)],
+                )
+
+            errors: list[tuple[str, str, str]] = []
+
+            def worker_push(fidx: int) -> None:
+                fname = f"sc0{fidx}.json"
+                for batch in range(4):
+                    lines = [f"@@ file: {fname}"]
+                    for i in range(batch * 10 + 1, (batch + 1) * 10 + 1):
+                        lines.append(f"{i}|译文{fidx}_{i}")
+                    try:
+                        push_batch(proj, "\n".join(lines), refresh_output=False, session_id=f"w{fidx}")
+                    except Exception as exc:
+                        errors.append((f"push_{fidx}_{batch}", type(exc).__name__, str(exc)))
+
+            def worker_pull(fidx: int) -> None:
+                fname = f"sc0{fidx}.json"
+                for _ in range(12):
+                    try:
+                        pull_batch(proj, file_patterns=[fname], session_id=f"p{fidx}")
+                    except Exception as exc:
+                        errors.append((f"pull_{fidx}", type(exc).__name__, str(exc)))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(worker_push, i) for i in range(4)] + [ex.submit(worker_pull, i) for i in range(4)]
+                concurrent.futures.wait(futs)
+
+            self.assertEqual(errors, [])
+            hist_lines = cfg.history_path(proj).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(hist_lines), 16)
+            for ln in hist_lines:
+                json.loads(ln)
+
+            # 2) Same-file concurrent push_batch (disjoint index ranges) must suffer ZERO lost updates
+            proj2 = Path(tmp) / "conc_same"
+            cfg.save(proj2)
+            save_input_file(
+                proj2,
+                cfg,
+                "sc00.json",
+                [SentenceItem("sc00.json", i, pre_src=f"「テスト_{i}」", speaker="遥") for i in range(1, 61)],
+            )
+            errors2: list[tuple[str, str, str]] = []
+
+            def push_range(lo: int, hi: int, tag: str) -> None:
+                for start in range(lo, hi, 5):
+                    lines = ["@@ file: sc00.json"] + [
+                        f"{i}|译文_{tag}_{i}" for i in range(start, min(start + 5, hi))
+                    ]
+                    try:
+                        push_batch(proj2, "\n".join(lines), refresh_output=False)
+                    except Exception as exc:
+                        errors2.append((tag, type(exc).__name__, str(exc)))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+                f1 = ex.submit(push_range, 1, 31, "A")
+                f2 = ex.submit(push_range, 31, 61, "B")
+                concurrent.futures.wait([f1, f2])
+
+            self.assertEqual(errors2, [])
+            loaded2 = load_project_files(proj2, cfg)[0][2]
+            self.assertEqual(sum(1 for it in loaded2 if it.pre_dst), 60)
+
+    def test_c2_rebuild_preserves_post_src_changed_miss(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "p"
+            cfg = ProjectConfig(project_name="c2")
+            cfg.save(proj)
+            save_input_file(proj, cfg, "ch01.json", [SentenceItem("ch01.json", 1, pre_src="「旧単語だ」", speaker="遥")])
+            push_batch(proj, "@@ file: ch01.json\n1|旧词译文\n")
+
+            (proj / "项目字典_译前.tsv").write_text("旧単語\t新単語\n", encoding="utf-8")
+            reb = rebuild_project(proj, ignore_post_src=False)
+            self.assertEqual(reb["cache_misses"], 1)
+            self.assertEqual(reb["miss_breakdown"].get(MISS_POST_SRC_CHANGED), 1)
+
+            # Subsequent batch-pull --only-miss MUST still see post_src_changed and pull the line!
+            after_pull = pull_batch(proj, only_miss=True)
+            self.assertEqual(after_pull["selected_count"], 1)
+            self.assertEqual(after_pull["miss_breakdown"].get(MISS_POST_SRC_CHANGED), 1)
+
+    def test_c3_consecutive_identical_lines_no_cache_key_clobber(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "p"
+            cfg = ProjectConfig(project_name="c3")
+            cfg.save(proj)
+            items = [
+                SentenceItem("ch01.json", i, pre_src="「……」", speaker="遥")
+                for i in range(1, 5)
+            ]
+            save_input_file(proj, cfg, "ch01.json", items)
+            push_batch(proj, "@@ file: ch01.json\n1|一\n2|二\n3|三\n4|四\n")
+            loaded = load_project_files(proj, cfg)[0][2]
+            self.assertEqual([(it.index, it.pre_dst) for it in loaded], [(1, "一"), (2, "二"), (3, "三"), (4, "四")])
+
+    def test_c4_gbk_push_no_crash_speaker_gbk_check_and_clean_export_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "gbk_p"
+            cfg = ProjectConfig(project_name="gbk_p", target_encoding="gbk", speaker_map={"遥・琴音": "遥・琴音"})
+            cfg.save(proj)
+            save_input_file(
+                proj,
+                cfg,
+                "ch01.json",
+                [
+                    SentenceItem(
+                        "ch01.json",
+                        1,
+                        pre_src="「おはよう♪」",
+                        speaker="遥・琴音",
+                        speakers_raw="遥・琴音",
+                        extra={"_name_key": "name"},
+                    )
+                ],
+            )
+            # Must NOT crash with UnicodeEncodeError before returning Delta Repair!
+            res = push_batch(proj, "@@ file: ch01.json\n1|早上好♪\n", pull_next=True)
+            self.assertEqual(res["pull_next_status"], "blocked_by_errors")
+            self.assertEqual(res["hard_error_count"], 1)
+            probs = res["hard_error_items"][0]["problems"]
+            self.assertTrue(any(p.startswith("非GBK字符：") for p in probs))
+            self.assertTrue(any(p.startswith("非GBK字符(说话人)：") for p in probs))
+
+            # Even with gbk_whitelist + --allow-errors, CLI export must return clean rc=1 instead of crashing
+            cfg.gbk_whitelist = ["♪", "・"]
+            cfg.save(proj)
+            rc, out = _run_cli(["export", "--project", str(proj), "--allow-errors", "--out-format", "json"])
+            self.assertEqual(rc, 1)
+            self.assertEqual(json.loads(out)["status"], "encoding_error")
+
+    def test_h1_modern_acg_no_single_char_false_hard_errors(self) -> None:
+        cfg = ProjectConfig(profile="modern_acg")
+        prof = json.loads((FRAMEWORK_ROOT / "profiles" / "modern_acg.json").read_text(encoding="utf-8"))
+        tp = TextPreserver.from_project(cfg)
+
+        for sent in ("之前我也去过", "你也太在乎了吧", "我也不是故意的", "或者这样也行", "甚至连他也来了"):
+            it = SentenceItem(
+                "s.json", 1, pre_src="「テスト」", post_src="テスト",
+                pre_dst=sent, post_dst=f"「{sent}」", speaker="遥", is_dialogue=True,
+            )
+            probs = check_item_problems(it, cfg, profile=prof, preserver=tp)
+            self.assertFalse(any(p.startswith("语域违和词") for p in probs), f"False register flag on {sent!r}: {probs}")
+
+        # Truly archaic dialogue still flags AND its severity is soft warn (not circuit-breaker hard error)
+        it_arch = SentenceItem(
+            "s.json", 2, pre_src="「吾が剣」", post_src="吾が剣",
+            pre_dst="吾之剑锋亦乃天命", post_dst="「吾之剑锋亦乃天命」", speaker="剑圣", is_dialogue=True,
+        )
+        arch_probs = [p for p in check_item_problems(it_arch, cfg, profile=prof, preserver=tp) if p.startswith("语域违和词")]
+        self.assertTrue(arch_probs)
+        self.assertEqual(problem_severity(arch_probs[0]), "warn")
+        self.assertEqual(problem_severity("语域违和词：绝绝子"), "error")
+
+    def test_h2_compact_patch_braces_numeric_id_missing_plus_and_empty_dst(self) -> None:
+        # 1) Brace-starting & brace-containing dst in grouped compact and bare compact
+        e1, err1 = parse_patch_text("@@ file: ch01.json\n1|{player_name}，早上好\n2|{color=#fff}警告{/color}\n")
+        self.assertEqual(err1, [])
+        self.assertEqual([(e.index, e.dst) for e in e1], [(1, "{player_name}，早上好"), (2, "{color=#fff}警告{/color}")])
+
+        e2, err2 = parse_patch_text("1|你好，{player_name}\n")
+        self.assertEqual(err2, [])
+        self.assertEqual([(e.index, e.dst) for e in e2], [(1, "你好，{player_name}")])
+
+        # JSONL with numeric 3-char anchor prefix must still parse as JSONL
+        e_jl, err_jl = parse_patch_text('123|{"file": "ch01.json", "id": 5, "dst": "你好"}\n')
+        self.assertEqual(err_jl, [])
+        self.assertEqual((e_jl[0].anchor, e_jl[0].index, e_jl[0].dst), ("123", 5, "你好"))
+
+        # 2) Indented `+` accepted; missing `+` inside `@@` block produces explicit parse error
+        e3, err3 = parse_patch_text("@@ ch01.json|1\n  +缩进译文\n@@ ch01.json|2\n忘了加号\n")
+        self.assertEqual(e3[0].dst, "缩进译文")
+        self.assertTrue(any("missing '+'" in err for err in err3))
+
+        # 3) Empty dst `1|` rejected as error (not Clean!) & 3-digit ID `123|1|第一选项` disambiguated
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "h2"
+            cfg = ProjectConfig(project_name="h2")
+            cfg.save(proj)
+            items = [SentenceItem("ch01.json", i, pre_src=f"「台詞{i}」", speaker="遥") for i in range(1, 125)]
+            save_input_file(proj, cfg, "ch01.json", items)
+
+            res_empty = push_batch(proj, "@@ file: ch01.json\n1|\n")
+            self.assertEqual(res_empty["applied_count"], 0)
+            self.assertEqual(res_empty["error_count"], 1)
+            self.assertTrue(any("empty translation" in e for e in res_empty["errors"]))
+
+            res_amb = push_batch(proj, "@@ file: ch01.json\n123|1|第一选项\n")
+            self.assertEqual(res_amb["error_count"], 0)
+            self.assertEqual(res_amb["applied_count"], 1)
+            loaded = load_project_files(proj, cfg)[0][2]
+            self.assertEqual(loaded[0].pre_dst, "")
+            self.assertEqual(loaded[122].pre_dst, "1|第一选项")
+
+    def test_h3_circuit_breaker_blocks_partial_repair_bypass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "h3"
+            cfg = ProjectConfig(project_name="h3", preserve_presets=["base", "kag"])
+            cfg.save(proj)
+            save_input_file(
+                proj,
+                cfg,
+                "ch01.json",
+                [
+                    SentenceItem("ch01.json", 1, pre_src="「[l]一」", speaker="遥"),
+                    SentenceItem("ch01.json", 2, pre_src="「[l]二」", speaker="遥"),
+                    SentenceItem("ch01.json", 3, pre_src="「三」", speaker="遥"),
+                ],
+            )
+            r1 = push_batch(proj, "@@ file: ch01.json\n1|一\n2|二\n", pull_next=True, session_id="w_cb", batch_size=2)
+            self.assertEqual(r1["pull_next_status"], "blocked_by_errors")
+            self.assertEqual([x["id"] for x in r1["next_batch"]["items"]], [1, 2])
+
+            # Fixing ONLY #1 (omitting #2) MUST stay blocked and point to #2!
+            r2 = push_batch(proj, "@@ file: ch01.json\n1|[l]一\n", pull_next=True, session_id="w_cb", batch_size=2)
+            self.assertEqual(r2["pull_next_status"], "blocked_by_errors")
+            self.assertEqual([x["id"] for x in r2["next_batch"]["items"]], [2])
+
+            # Fixing #2 clears all blocking hard errors and advances to #3!
+            r3 = push_batch(proj, "@@ file: ch01.json\n2|[l]二\n", pull_next=True, session_id="w_cb", batch_size=2)
+            self.assertEqual(r3["pull_next_status"], "advanced")
+            self.assertEqual([x["id"] for x in r3["next_batch"]["items"]], [3])
+
+    def test_h4_builtin_dicts_safe_and_project_normal_dict_overrides_builtin(self) -> None:
+        # 1) pre_h_phonetic.tsv is opt-in by default and safe on normal Japanese even when loaded
+        self.assertNotIn("builtin:pre_h_phonetic.tsv", ProjectConfig().pre_dicts)
+        h_dict = NormalDict()
+        self.assertGreaterEqual(h_dict.load_file(FRAMEWORK_ROOT / "dicts" / "pre_h_phonetic.tsv"), 200)
+        h_dict.sort_by_length()
+        for jp in ("助けろ！", "開けろ！", "もらって嬉しい", "あきらめ、立ち上がる", "あおぐ", "こんにゃく", "ひょっこり"):
+            it = SentenceItem("s.json", 1, pre_src=jp, post_src=jp)
+            self.assertEqual(h_dict.apply(jp, it), jp)
+
+        # 2) post_symbol_common.tsv preserves Chinese quotes, does NOT rewrite 撒旦->魔王, handles 《》+『』 together
+        post_common = NormalDict()
+        post_common.load_file(FRAMEWORK_ROOT / "dicts" / "post_symbol_common.tsv")
+        post_common.sort_by_length()
+        cfg = ProjectConfig()
+        it_q = SentenceItem("s.json", 1, pre_src="「彼は天才だ」", pre_dst="他就是个“天才”", speaker="遥")
+        strip_outer_shell([it_q])
+        self.assertEqual(normalize_and_restore_dst(it_q, cfg, post_dict=post_common), "「他就是个“天才”」")
+        it_sat = SentenceItem("s.json", 2, pre_src="「悪魔が来た」", pre_dst="撒旦来了", speaker="遥")
+        strip_outer_shell([it_sat])
+        self.assertEqual(normalize_and_restore_dst(it_sat, cfg, post_dict=post_common), "「撒旦来了」")
+        it_both = SentenceItem("s.json", 3, pre_src="《章》と『名』", post_src="《章》と『名』", pre_dst="《章》和『名』")
+        self.assertEqual(normalize_and_restore_dst(it_both, cfg, post_dict=post_common), "《章》和『名』")
+
+        # 3) gpt_common_acg.tsv allows 学长/学姐/学弟/学妹
+        gd = GptDict()
+        gd.load_file(FRAMEWORK_ROOT / "dicts" / "gpt_common_acg.tsv")
+        it_sp = SentenceItem("s.json", 4, pre_src="「先輩、おはよう」", post_src="先輩、おはよう", pre_dst="学长，早上好", post_dst="「学长，早上好」", speaker="遥")
+        self.assertFalse(any(p.startswith("字典未使用") for p in check_item_problems(it_sp, cfg, gpt_dict=gd)))
+
+        # 4) Project NormalDict overrides lower-priority builtin rule of equal search key
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "nd_ov"
+            cfg_ov = ProjectConfig(project_name="nd_ov")
+            cfg_ov.save(proj)
+            (proj / "项目字典_译后.tsv").write_text("~\t~\n", encoding="utf-8")
+            _, _, loaded_post = load_project_dicts(cfg_ov, proj)
+            it_ov = SentenceItem("s.json", 1, pre_src="a~b", post_src="a~b", pre_dst="a~b")
+            self.assertEqual(normalize_and_restore_dst(it_ov, cfg_ov, post_dict=loaded_post), "a~b")
+
+    def test_h5_pua_placeholders_immune_to_tp_post_dict(self) -> None:
+        cfg = ProjectConfig(preserve_presets=["base"])
+        tp = TextPreserver.from_project(cfg)
+        pd = NormalDict()
+        pd.load_tsv_text("TP\t技力\n")
+        it = SentenceItem("s.json", 1, pre_src="「<color=#fff>テスト</color>」", pre_dst="<color=#fff>TP回复</color>", speaker="遥")
+        strip_outer_shell([it])
+        self.assertEqual(normalize_and_restore_dst(it, cfg, post_dict=pd, preserver=tp), "「<color=#fff>技力回复</color>」")
+
+    def test_h6_presets_and_ruby_kana_leak_detection(self) -> None:
+        tp_base = TextPreserver.from_project(ProjectConfig(preserve_presets=["base"]))
+        self.assertTrue(tp_base.verify_preserved_detailed("50%OFF", "半价").ok)
+        self.assertTrue(tp_base.verify_preserved_detailed("100%Clear", "全通关").ok)
+        self.assertFalse(tp_base.verify_preserved_detailed("%sさん", "先生").ok)
+
+        tp_kag = TextPreserver.from_project(ProjectConfig(preserve_presets=["base", "kag"], ruby_preserve_mode="translate"))
+        self.assertTrue(tp_kag.verify_preserved_detailed('[ruby text="magic"]魔法', '[ruby text="魔法"]魔法').ok)
+
+        tp_rm = TextPreserver.from_project(ProjectConfig(preserve_presets=["base", "rpgmaker"]))
+        self.assertTrue(tp_rm.verify_preserved_detailed("hello\\nworld", "你好\\n世界").ok)
+        tp_wolf = TextPreserver.from_project(ProjectConfig(preserve_presets=["base", "wolf"]))
+        self.assertTrue(tp_wolf.verify_preserved_detailed("hello\\nworld", "你好\\n世界").ok)
+
+        # Ruby kana leaks caught in translate mode; M2 emphasis dot `[・]` allowed
+        cfg_all = ProjectConfig(preserve_presets=["base", "kag", "rpgmaker", "scn_m2"], ruby_preserve_mode="translate")
+        tp_all = TextPreserver.from_project(cfg_all)
+        for src, dst in (
+            ("<rしんじつ>真実</r>を知る", "知晓<rしんじつ>真实</r>"),
+            ('[ruby text="しんじつ"]真実', '[ruby text="しんじつ"]真实'),
+            ("これは\\r[真実,しんじつ]だ", "这就是\\r[真実,しんじつ]"),
+            ("「[ルビ,1]の力だ」", "「[ルビ,1]的力量」"),
+        ):
+            it = SentenceItem("s.json", 1, pre_src=src, post_src=src, pre_dst=dst, post_dst=dst)
+            probs = check_item_problems(it, cfg_all, preserver=tp_all)
+            self.assertTrue(any(p.startswith("残留日文") for p in probs), f"Missed ruby kana leak on {dst!r}: {probs}")
+
+        it_dot = SentenceItem("s.json", 2, pre_src="「[・]重点」", post_src="[・]重点", pre_dst="[・]重点", post_dst="「[・]重点」")
+        self.assertFalse(any("残留" in p for p in check_item_problems(it_dot, cfg_all, preserver=tp_all)))
+
+    def test_h7_compact_pipe_edge_cases_and_br_literal_newline_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "sc.txt"
+            p.write_text(
+                "0001|ちょっと待って\\|すぐ行く\n"
+                "0002|[遥]\"待って\\|すぐ行く\"\n"
+                "0003|[l]「おはよう」\n",
+                encoding="utf-8",
+            )
+            _, _, its = compact_pipe.import_file(p, "sc.txt")
+            self.assertEqual((its[0].speaker, its[0].pre_src, its[0].speaker_style), ("", "ちょっと待って\\|すぐ行く", "plain"))
+            self.assertEqual((its[1].speaker, its[1].pre_src, its[1].speaker_style), ("遥", "\"待って\\|すぐ行く\"", "bracket"))
+            self.assertEqual((its[2].speaker, its[2].pre_src, its[2].speaker_style), ("", "[l]「おはよう」", "plain"))
+
+            p_brk = Path(tmp) / "brk.txt"
+            p_brk.write_text("0004|[遥]……\n", encoding="utf-8")
+            _, _, its_b = compact_pipe.import_file(p_brk, "brk.txt", pipe_style="bracket")
+            self.assertEqual((its_b[0].speaker, its_b[0].pre_src, its_b[0].speaker_style), ("遥", "……", "bracket"))
+
+            # <br> converts to literal \\n when post_src uses \\n and dst has no \\n
+            proj = Path(tmp) / "p_br"
+            cfg = ProjectConfig(project_name="p_br", preserve_presets=["base", "kag"])
+            cfg.save(proj)
+            save_input_file(proj, cfg, "ch01.json", [SentenceItem("ch01.json", 1, pre_src="「[l]ちょっと待って、\\n息が切れた……」", speaker="遥")])
+            r_ok = push_batch(proj, "@@ file: ch01.json\n1|[l]等一下，<br>喘不过气了……\n")
+            self.assertEqual(r_ok["hard_error_count"], 0)
+            self.assertEqual(load_project_files(proj, cfg)[0][2][0].post_dst, "「[l]等一下，\\n喘不过气了……」")
+
+        # Prompt rendering fixes mixed CRLF+LF and avoids corrupting `|` in compact mode
+        it_mix = SentenceItem("s.json", 1, pre_src="一行目\r\n二行目\n三行目", post_src="一行目\r\n二行目\n三行目")
+        self.assertEqual(_render_src_for_prompt(it_mix), "一行目<br>二行目<br>三行目")
+        it_pipe = SentenceItem("s.json", 2, pre_src="待って\\|すぐ行く", post_src="待って\\|すぐ行く")
+        self.assertEqual(_render_src_for_prompt(it_pipe, escape_pipe=False), "待って\\|すぐ行く")
+
+    def test_m1_seed_gate_requires_per_round_sampling_and_export_blocks_hard_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sl = SeedLedger(Path(tmp) / "seeds.json", min_required_rounds=2)
+            dummy = [
+                SentenceItem("c.json", i, pre_src=f"s{i}", post_src=f"s{i}", pre_dst=f"d{i}", post_dst=f"d{i}", status="PROCESSED")
+                for i in range(1, 31)
+            ]
+            # 2 samples BOTH in Round 1 + 0 samples in Round 2 -> MUST FAIL check_gate!
+            sl.sample_dispersed(dummy)
+            sl.sample_dispersed(dummy)
+            sl.complete_round()
+            sl.complete_round()
+            passed, reasons = sl.check_gate(open_error_count=0, open_warn_count=0, max_warn_budget=5)
+            self.assertFalse(passed)
+            self.assertTrue(any("round(s): [2]" in r for r in reasons))
+
+            # CLI export blocks hard errors unless --allow-errors is supplied
+            proj = Path(tmp) / "p_exp"
+            cfg = ProjectConfig(project_name="p_exp", preserve_presets=["base", "kag"])
+            cfg.save(proj)
+            save_input_file(proj, cfg, "ch01.json", [SentenceItem("ch01.json", 1, pre_src="「[l]おはよう」", speaker="遥")])
+            push_batch(proj, "@@ file: ch01.json\n1|早上好\n", refresh_output=False)
+            rc_blk, out_blk = _run_cli(["export", "--project", str(proj), "--out-format", "json"])
+            self.assertEqual(rc_blk, 1)
+            self.assertEqual(json.loads(out_blk)["status"], "blocked")
+            rc_ok, _ = _run_cli(["export", "--project", str(proj), "--allow-errors", "--out-format", "json"])
+            self.assertEqual(rc_ok, 0)
+
+    def test_m2_dictionary_conditional_exclude_and_single_kanji_boundaries(self) -> None:
+        gd = GptDict(
+            [
+                GptDictEntry("潤", "润"),
+                GptDictEntry("遥", "遥"),
+                GptDictEntry("光", "光"),
+                GptDictEntry("星見坂駅前", "星见坂站前", info="[条件]仅指车站"),
+                GptDictEntry("星見坂", "星见坂"),
+                GptDictEntry("星見坂学園", "星见坂学园", info="[exclude:星見坂学園前]"),
+                GptDictEntry("学園前", "学园前"),
+            ]
+        )
+        # Non-name okurigana stems must NOT false-positive
+        for src, dst in (
+            ("瞳が潤っている", "眼眶泛起水雾"),
+            ("遥かな空を見上げた", "望着远方的天空"),
+            ("星が光らない夜", "星辰黯淡的夜晚"),
+        ):
+            it = SentenceItem("s.json", 1, pre_src=src, post_src=src, pre_dst=dst, post_dst=dst)
+            self.assertEqual(gd.check_usage(it, dst), [])
+
+        # Quotative `潤って優しい` and question `遥か？` MUST still verify character name!
+        it_q1 = SentenceItem("s.json", 2, pre_src="潤って優しいよね", post_src="潤って優しいよね", pre_dst="他真温柔呢", post_dst="他真温柔呢")
+        self.assertIn("字典未使用：潤->润", gd.check_usage(it_q1, it_q1.post_dst))
+
+        # Conditional longer term must NOT shadow unconditional shorter term 星見坂
+        it_cond = SentenceItem("s.json", 3, pre_src="星見坂駅前で待つ", post_src="星見坂駅前で待つ", pre_dst="在车站前等你", post_dst="在车站前等你")
+        self.assertIn("字典未使用：星見坂->星见坂", gd.check_usage(it_cond, it_cond.post_dst))
+
+        # Excluded span of longer term must NOT be masked away from shorter term 学園前
+        it_ex = SentenceItem("s.json", 4, pre_src="星見坂学園前と星見坂学園", post_src="星見坂学園前と星見坂学園", pre_dst="在站前和星见坂学园", post_dst="在站前和星见坂学园")
+        self.assertIn("字典未使用：学園前->学园前", gd.check_usage(it_ex, it_ex.post_dst))
+
+    def test_m3_m4_m5_revert_order_edit_cache_search_replace_and_gt_json_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # M-3: duplicate index in same batch reverts cleanly in reverse order
+            proj = Path(tmp) / "m34"
+            cfg = ProjectConfig(project_name="m34")
+            cfg.save(proj)
+            save_input_file(proj, cfg, "sub/ch01.json", [SentenceItem("sub/ch01.json", 1, pre_src="「一」", speaker="遥")])
+            push_batch(proj, "@@ file: sub/ch01.json\n1|原始初译\n")
+            r_dup = push_batch(proj, "@@ file: sub/ch01.json\n1|错误A\n1|错误B\n")
+            revert_task(proj, r_dup["task_id"])
+            self.assertEqual(load_project_files(proj, cfg)[0][2][0].pre_dst, "原始初译")
+
+            # M-4: Windows backslash path in edit_cache + status reconciliation + strict field in search_replace
+            push_batch(proj, "@@ file: sub/ch01.json\n1|旧词精修\n", proofread=True)
+            res_win = edit_cache_entries(proj, [{"file": r"sub\ch01.json", "index": 1, "pre_dst": "旧词初译"}])
+            self.assertEqual(res_win["error_count"], 0)
+            it_mid = load_project_files(proj, cfg)[0][2][0]
+            self.assertEqual(it_mid.status, ItemStatus.PROOFREAD.value)
+            self.assertEqual(it_mid.pre_dst, "旧词初译")
+            self.assertEqual(it_mid.proofread_dst, "旧词精修")
+
+            search_replace_project(proj, "旧词", "新词", field="pre_dst")
+            it_sr = load_project_files(proj, cfg)[0][2][0]
+            self.assertEqual(it_sr.pre_dst, "新词初译")
+            self.assertEqual(it_sr.proofread_dst, "旧词精修")
+
+            # Clearing proofread_dst drops status cleanly back to PROCESSED
+            edit_cache_entries(proj, [{"file": "sub/ch01.json", "index": 1, "proofread_dst": ""}])
+            it_clr = load_project_files(proj, cfg)[0][2][0]
+            self.assertEqual(it_clr.status, ItemStatus.PROCESSED.value)
+            self.assertEqual(it_clr.post_dst, "「新词初译」")
+
+            # M-5: gt_json lossless null, _meta/raw_id/speaker_style preservation, and multi-speaker override
+            gj = Path(tmp) / "g.json"
+            gj.write_text(
+                json.dumps(
+                    [
+                        {"name": None, "message": None, "raw_id": "ORIG_1", "speaker_style": "custom", "_meta": {"keep": 1}},
+                        {"names": ["遥", "琴音"], "message": "「せーの」"},
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            _, _, gitems = gt_json.import_file(gj, "g.json")
+            self.assertEqual((gitems[0].speaker, gitems[0].speakers_raw), ("", None))
+            proj_g = Path(tmp) / "pg"
+            cfg.save(proj_g)
+            save_input_file(proj_g, cfg, "g.json", gitems)
+            loaded_g = load_project_files(proj_g, cfg)[0][2]
+            loaded_g[1].speaker_dst = "遥、琴音"
+            out_g = Path(tmp) / "out_g.json"
+            gt_json.export_file(out_g, loaded_g, {}, speaker_map={})
+            exported = json.loads(out_g.read_text(encoding="utf-8"))
+            self.assertIsNone(exported[0]["name"])
+            self.assertIsNone(exported[0]["message"])
+            self.assertEqual(exported[0]["raw_id"], "ORIG_1")
+            self.assertEqual(exported[0]["speaker_style"], "custom")
+            self.assertEqual(exported[0]["_meta"], {"keep": 1})
+            self.assertEqual(exported[1]["names"], ["遥", "琴音"])
+
+    def test_l1_l2_l3_regex_trailing_control_and_speaker_post_dict(self) -> None:
+        # L-1: standalone \p{Script=Han}, uppercase <R...> envelope, non-empty zero-len rejection
+        self.assertEqual(normalize_regex_pattern(r"\p{Script=Han}+"), r"[\u4e00-\u9fff\u3400-\u4dbf]+")
+        self.assertEqual(normalize_regex_pattern(r"[^\p{Script=Han}]"), r"[^\u4e00-\u9fff\u3400-\u4dbf]")
+        tp = TextPreserver.from_project(ProjectConfig(preserve_presets=["base"]))
+        self.assertTrue(tp.verify_preserved_detailed("<Rしんじつ>真実</r>", "<r真实>真实</r>", ruby_mode="translate").ok)
+        self.assertFalse(tp.add_rule(PreserveRule(src=r"(?=a)", info="lookahead")))
+        self.assertFalse(tp.add_rule(PreserveRule(src=r"\b", info="word-boundary")))
+
+        # L-2: trailing control code still aligns trailing period and ♪
+        cfg_kag = ProjectConfig(preserve_presets=["base", "kag"])
+        tp_kag = TextPreserver.from_project(cfg_kag)
+        it_l = SentenceItem("s.json", 1, pre_src="「おはよう[l]」", speaker="遥")
+        strip_outer_shell([it_l])
+        it_l.pre_dst = "早上好。[l]"
+        self.assertEqual(normalize_and_restore_dst(it_l, cfg_kag, preserver=tp_kag), "「早上好[l]」")
+        it_n = SentenceItem("s.json", 2, pre_src="「行こう♪[l]」", speaker="遥")
+        strip_outer_shell([it_n])
+        it_n.pre_dst = "走吧[l]"
+        self.assertEqual(normalize_and_restore_dst(it_n, cfg_kag, preserver=tp_kag), "「走吧♪[l]」")
+
+        # L-3: use_post_dict_in_name active & rebuild clears stale speaker_dst removed from speaker_map
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "l3"
+            cfg = ProjectConfig(project_name="l3", use_post_dict_in_name=True, speaker_map={"遥": "旧遥"})
+            cfg.save(proj)
+            (proj / "项目字典_译后.tsv").write_text("旧遥\t新遥\n", encoding="utf-8")
+            save_input_file(proj, cfg, "ch01.json", [SentenceItem("ch01.json", 1, pre_src="「一」", speaker="遥")])
+            push_batch(proj, "@@ file: ch01.json\n1|一\n")
+            self.assertEqual(load_project_files(proj, cfg)[0][2][0].speaker_dst, "新遥")
+
+            # Remove from speaker_map & disable use_post_dict_in_name -> rebuild clears stale speaker_dst
+            cfg.speaker_map = {}
+            cfg.use_post_dict_in_name = False
+            cfg.save(proj)
+            rebuild_project(proj)
+            self.assertEqual(load_project_files(proj, cfg)[0][2][0].speaker_dst, "")
 
 
 if __name__ == "__main__":

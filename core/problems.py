@@ -75,10 +75,12 @@ def problem_severity(prob_str: str) -> str:
     s = (prob_str or "").strip()
     if not s:
         return "warn"
+    if s.startswith("语域违和词：高语域过密"):
+        return "warn"
     head = s.split("：", 1)[0].split(":", 1)[0].strip()
     if head in _SOFT_WARN_SET or head.startswith("字典未使用"):
         return "warn"
-    if head in _HARD_ERROR_SET:
+    if head in _HARD_ERROR_SET or head.startswith("非GBK字符"):
         return "error"
     if head.startswith(("本无", "本有")):
         return "error"
@@ -186,6 +188,47 @@ def _most_common_char(text: str) -> tuple[str, int]:
     if not counts:
         return "", 0
     return counts.most_common(1)[0]
+
+
+def _extract_ruby_inner_text(tag: str) -> str:
+    """Extract user-visible ruby reading/content from a ruby control tag for kana-leak auditing."""
+    t = tag.strip()
+    tl = t.lower()
+    if not t or tl.startswith("</") or tl in ("<ruby>", "<rt>", "<rb>"):
+        return ""
+    if tl.startswith(("<ruby", "<rt", "<rb")):
+        return ""
+    if tl.startswith("<r") and t.endswith(">"):
+        return t[2:-1]
+    m_kag = re.match(r"^\[ruby\s+text\s*=\s*(.+)\]$", t, flags=re.IGNORECASE)
+    if m_kag:
+        val = m_kag.group(1).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        return val
+    m_rm = re.match(r"^\\r\[(.+)\]$", t, flags=re.IGNORECASE)
+    if m_rm:
+        return m_rm.group(1)
+    if t.startswith("[") and t.endswith("]"):
+        inner = t[1:-1].strip()
+        # M2 PSB emphasis dot `[・]` is structural markup, not leaked prose
+        if inner == "・":
+            return ""
+        return inner
+    return ""
+
+
+def _resolve_effective_speaker_for_gbk(item: SentenceItem, config: ProjectConfig) -> str:
+    raw = item.speakers_raw
+    if isinstance(raw, list):
+        if item.speaker_dst:
+            return item.speaker_dst
+        return "".join(config.speaker_map.get(str(n), str(n)) for n in raw if n is not None)
+    if item.speaker_dst:
+        return item.speaker_dst
+    if item.speaker:
+        return config.speaker_map.get(item.speaker, item.speaker)
+    return ""
 
 
 def _non_gbk_chars(text: str, whitelist: list[str]) -> str:
@@ -298,9 +341,15 @@ def check_item_problems(
                     found.append(f"多加换行：原0译{inner_post_dst.count(extra_lb)}")
                     break
 
-    # 3. 残留日文 / 原文输出 & 4. 附着记号残留
-    attached_hits = "".join(dict.fromkeys(_ATTACHED_MARK_RE.findall(clean_post_dst)))
-    kana_hits = "".join(dict.fromkeys(_KANA_CORE_RE.findall(clean_post_dst)))
+    # 3. 残留日文 / 原文输出 & 4. 附着记号残留（非 verbatim Ruby 模式下同步审计 Ruby 内部未翻假名）
+    kana_audit_text = clean_post_dst
+    if preserver is not None and config.ruby_preserve_mode != "verbatim":
+        ruby_inners = [_extract_ruby_inner_text(sp.text) for sp in preserver.extract_ruby_spans(post_dst)]
+        ruby_blob = "".join(r for r in ruby_inners if r)
+        if ruby_blob:
+            kana_audit_text = f"{clean_post_dst}\n{ruby_blob}"
+    attached_hits = "".join(dict.fromkeys(_ATTACHED_MARK_RE.findall(kana_audit_text)))
+    kana_hits = "".join(dict.fromkeys(_KANA_CORE_RE.findall(kana_audit_text)))
     if "残留日文" in enabled:
         if pre_src and pre_src == post_dst and (_KANA_CORE_RE.search(pre_src) or _ATTACHED_MARK_RE.search(pre_src)):
             found.append("原文输出")
@@ -388,11 +437,16 @@ def check_item_problems(
             if "他" in _strip_monologue_excludes(clean_post_dst):
                 found.append("独白男他")
 
-    # 14. 非GBK字符
+    # 14. 非GBK字符（正文 + 说话人输出）
     if "非GBK字符" in enabled and config.target_encoding.lower() in ("gbk", "gb2312", "cp936"):
         bad_gbk = _non_gbk_chars(post_dst, config.gbk_whitelist)
         if bad_gbk:
             found.append(f"非GBK字符：{bad_gbk}")
+        eff_spk = _resolve_effective_speaker_for_gbk(item, config)
+        if eff_spk:
+            bad_spk_gbk = _non_gbk_chars(eff_spk, config.gbk_whitelist)
+            if bad_spk_gbk:
+                found.append(f"非GBK字符(说话人)：{bad_spk_gbk}")
 
     # 15. 无依据器官词强补
     organ_enabled = config.enable_organ_injection_check and bool(

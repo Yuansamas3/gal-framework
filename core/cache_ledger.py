@@ -6,6 +6,7 @@ import fnmatch
 import json
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,11 +14,16 @@ from typing import Any, Sequence
 
 from adapters import gt_json
 from .dictionary import NormalDict
-from .models import ItemStatus, ProjectConfig, SentenceItem
+from .models import ItemStatus, ProjectConfig, SentenceItem, atomic_write_json, file_lock
 from .normalizer import preprocess_items
 from .problems import is_whitelisted
 
 CACHE_TEMP_SUFFIX = ".json.tmp"
+
+
+def project_ledger_lock(project_dir: Path):
+    """Return a cross-process/cross-thread lock guarding cache & ledger mutations for a project."""
+    return file_lock(project_dir / "work" / ".ledger.lock")
 
 # Legacy GalTransl key compatibility map: modern_key -> legacy_key
 CACHE_KEY_COMPAT: dict[str, str] = {
@@ -65,34 +71,21 @@ def cache_has(cache_obj: dict[str, Any], key: str) -> bool:
     return bool(old_key and old_key in cache_obj)
 
 
-def atomic_write_json(target_path: Path, data: Any) -> Path:
-    """Windows-safe atomic JSON write: `<file>.json.tmp` -> `os.replace()`."""
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = Path(str(target_path) + ".tmp")
-    try:
-        temp_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temp_path, target_path)
-    except Exception:
-        if temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-        raise
-    return target_path
-
-
-def cleanup_stale_cache_temp_files(cache_dir: Path) -> int:
-    """Remove leftover `*.json.tmp` files from interrupted writes at task startup."""
+def cleanup_stale_cache_temp_files(cache_dir: Path, *, min_age_seconds: float = 0.0) -> int:
+    """Remove leftover `*.tmp` files from interrupted writes (optionally requiring age >= min_age_seconds)."""
     if not cache_dir.exists() or not cache_dir.is_dir():
         return 0
+    now = time.time()
     removed = 0
-    for p in cache_dir.rglob(f"*{CACHE_TEMP_SUFFIX}"):
+    for p in cache_dir.rglob("*.tmp"):
         if not p.is_file():
             continue
+        if min_age_seconds > 0.0:
+            try:
+                if (now - p.stat().st_mtime) < min_age_seconds:
+                    continue
+            except OSError:
+                continue
         try:
             p.unlink()
             removed += 1
@@ -123,8 +116,10 @@ def build_context_cache_key(items: Sequence[SentenceItem], pos: int) -> str:
     return line_prev + line_now + line_next
 
 
-def _build_snapshot_lookup(cache_list: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], dict[int, dict[str, Any]]]:
-    by_key: dict[str, dict[str, Any]] = {}
+def _build_snapshot_lookup(
+    cache_list: list[dict[str, Any]],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[int, dict[str, Any]]]:
+    by_key: dict[str, list[dict[str, Any]]] = {}
     by_index: dict[int, dict[str, Any]] = {}
     n = len(cache_list)
     for i, obj in enumerate(cache_list):
@@ -137,12 +132,12 @@ def _build_snapshot_lookup(cache_list: list[dict[str, Any]]) -> tuple[dict[str, 
                 pass
         explicit_key = str(obj.get("__cache_key", ""))
         if explicit_key:
-            by_key[explicit_key] = obj
+            by_key.setdefault(explicit_key, []).append(obj)
             continue
         line_now = f"{obj.get('name', '')}{cache_get(obj, 'pre_src', '')}"
         prev_s = f"{cache_list[i - 1].get('name', '')}{cache_get(cache_list[i - 1], 'pre_src', '')}" if i > 0 else "None"
         next_s = f"{cache_list[i + 1].get('name', '')}{cache_get(cache_list[i + 1], 'pre_src', '')}" if i + 1 < n else "None"
-        by_key[(prev_s or "None") + line_now + (next_s or "None")] = obj
+        by_key.setdefault((prev_s or "None") + line_now + (next_s or "None"), []).append(obj)
     return by_key, by_index
 
 
@@ -224,6 +219,9 @@ def save_format_meta(project_dir: Path, config: ProjectConfig, rel_name: str, fo
         atomic_write_json(meta_sidecar_path(project_dir, config, rel_name), format_meta)
 
 
+_INTERNAL_EXTRA_KEYS = frozenset({"_name_key", "_cached_post_src", "_message_is_null"})
+
+
 def save_input_file(
     project_dir: Path,
     config: ProjectConfig,
@@ -231,27 +229,36 @@ def save_input_file(
     items: Sequence[SentenceItem],
     format_meta: dict[str, Any] | None = None,
 ) -> Path:
-    """Write normalized `gt_input/<rel_name>` preserving `_meta` and speaker structure."""
+    """Write normalized `gt_input/<rel_name>` preserving user keys losslessly and isolating adapter metadata."""
     rows: list[dict[str, Any]] = []
     for it in items:
         row: dict[str, Any] = {}
         name_key = str(it.extra.get("_name_key", ""))
-        if name_key == "names" and isinstance(it.speakers_raw, list):
-            row["names"] = list(it.speakers_raw)
+        if name_key == "names":
+            if isinstance(it.speakers_raw, list):
+                row["names"] = list(it.speakers_raw)
+            else:
+                row["names"] = it.speakers_raw
         elif name_key == "name":
-            row["name"] = str(it.speakers_raw if it.speakers_raw is not None else it.speaker)
+            row["name"] = it.speakers_raw if it.speakers_raw is None else str(it.speakers_raw)
         elif it.speaker:
             row["name"] = it.speaker
 
-        row["message"] = it.pre_src
+        row["message"] = None if it.extra.get("_message_is_null") else it.pre_src
 
-        meta_extra = {k: v for k, v in it.extra.items() if k != "_name_key"}
+        for k, v in it.extra.items():
+            if k in _INTERNAL_EXTRA_KEYS or k == "_gal_meta":
+                continue
+            if k not in row:
+                row[k] = v
+
+        gal_meta: dict[str, Any] = {}
         if it.raw_id:
-            meta_extra["raw_id"] = it.raw_id
+            gal_meta["raw_id"] = it.raw_id
         if it.speaker_style:
-            meta_extra["speaker_style"] = it.speaker_style
-        if meta_extra:
-            row["_meta"] = meta_extra
+            gal_meta["speaker_style"] = it.speaker_style
+        if gal_meta:
+            row["_gal_meta"] = gal_meta
         rows.append(row)
 
     target = config.input_path(project_dir) / rel_name
@@ -262,18 +269,25 @@ def save_input_file(
 
 
 def load_input_items(project_dir: Path, config: ProjectConfig, rel_name: str) -> tuple[dict[str, Any], list[SentenceItem]]:
-    """Read `gt_input/<rel_name>` into raw SentenceItems (unpacking `_meta`)."""
+    """Read `gt_input/<rel_name>` into raw SentenceItems (unpacking `_gal_meta` without losing user keys)."""
     path = config.input_path(project_dir) / rel_name
     _r, _m, items = gt_json.import_file(path, rel_name)
     for it in items:
-        meta = it.extra.pop("_meta", None)
-        if isinstance(meta, dict):
-            if "raw_id" in meta:
-                it.raw_id = str(meta.pop("raw_id"))
-            if "speaker_style" in meta:
-                it.speaker_style = str(meta.pop("speaker_style"))
-            for k, v in meta.items():
-                it.extra[k] = v
+        gal_meta = it.extra.pop("_gal_meta", None)
+        if isinstance(gal_meta, dict):
+            if "raw_id" in gal_meta:
+                it.raw_id = str(gal_meta["raw_id"])
+            if "speaker_style" in gal_meta:
+                it.speaker_style = str(gal_meta["speaker_style"])
+        else:
+            # Backward compat for older gt_input files that stored adapter metadata in `_meta`
+            legacy_meta = it.extra.get("_meta")
+            if isinstance(legacy_meta, dict) and set(legacy_meta.keys()) <= {"raw_id", "speaker_style"}:
+                it.extra.pop("_meta", None)
+                if "raw_id" in legacy_meta:
+                    it.raw_id = str(legacy_meta["raw_id"])
+                if "speaker_style" in legacy_meta:
+                    it.speaker_style = str(legacy_meta["speaker_style"])
     fmt_meta = load_format_meta(project_dir, config, rel_name)
     return fmt_meta, items
 
@@ -283,6 +297,8 @@ def save_cache_file(
     config: ProjectConfig,
     rel_name: str,
     items: Sequence[SentenceItem],
+    *,
+    preserve_miss_post_src: bool = False,
 ) -> Path:
     """Atomically write `transl_cache/<rel_name>` using canonical modern keys."""
     records: list[dict[str, Any]] = []
@@ -295,12 +311,19 @@ def save_cache_file(
             and not it.proofread_comment
         ):
             continue
+        persisted_post_src = it.post_src
+        if (
+            preserve_miss_post_src
+            and it.cache_miss_reason == MISS_POST_SRC_CHANGED
+            and "_cached_post_src" in it.extra
+        ):
+            persisted_post_src = str(it.extra["_cached_post_src"])
         rec: dict[str, Any] = {
             "index": it.index,
             "name": it.speaker,
             "name_preview": it.speaker_dst or config.speaker_map.get(it.speaker, ""),
             "pre_src": it.pre_src,
-            "post_src": it.post_src,
+            "post_src": persisted_post_src,
             "pre_dst": it.pre_dst,
             "proofread_dst": it.proofread_dst,
             "post_dst_preview": it.post_dst,
@@ -331,6 +354,7 @@ def join_input_with_cache(
 ) -> tuple[list[SentenceItem], list[SentenceItem]]:
     """Join preprocessed `gt_input` items with `transl_cache`, setting exact cache_miss_reason codes."""
     by_key, by_index = _build_snapshot_lookup(cache_entries)
+    consumed_obj_ids: set[int] = set()
     active_retran = config.retransl_keys if retran_keys is None else list(retran_keys)
     active_retry_failed = config.retransl_fail if retry_failed is None else retry_failed
 
@@ -339,6 +363,7 @@ def join_input_with_cache(
 
     for pos, it in enumerate(items):
         it.cache_miss_reason = ""
+        it.extra.pop("_cached_post_src", None)
         if it.pre_src == "" or it.post_src == "":
             it.status = ItemStatus.RULE_SKIPPED.value
             it.pre_dst = ""
@@ -346,18 +371,30 @@ def join_input_with_cache(
             hits.append(it)
             continue
 
-        ctx_key = build_context_cache_key(items, pos)
-        cache_obj = by_key.get(ctx_key)
-        if cache_obj is None:
-            cand = by_index.get(it.index)
-            if cand is not None and cache_get(cand, "pre_src", "") == it.pre_src:
+        # Prefer exact (index, pre_src, speaker) match to avoid 3-line __cache_key collisions
+        # across consecutive identical lines; fall back to FIFO context-key queue when lines shift.
+        cache_obj: dict[str, Any] | None = None
+        cand = by_index.get(it.index)
+        if cand is not None and id(cand) not in consumed_obj_ids:
+            cand_pre = cache_get(cand, "pre_src", "")
+            cand_spk = str(cand.get("name", "") or "")
+            if cand_pre == it.pre_src and (not cand_spk or not it.speaker or cand_spk == it.speaker):
                 cache_obj = cand
+
+        if cache_obj is None:
+            ctx_key = build_context_cache_key(items, pos)
+            for key_cand in by_key.get(ctx_key, ()):
+                if id(key_cand) not in consumed_obj_ids:
+                    cache_obj = key_cand
+                    break
 
         if cache_obj is None:
             it.cache_miss_reason = MISS_KEY_NOT_FOUND
             it.status = ItemStatus.NONE.value
             misses.append(it)
             continue
+
+        consumed_obj_ids.add(id(cache_obj))
 
         # Always hydrate metadata from cache before deciding hit/miss
         cached_pre_dst = str(cache_get(cache_obj, "pre_dst", "") or "")
@@ -385,6 +422,7 @@ def join_input_with_cache(
         if no_proofread:
             if not ignore_post_src and cached_post_src != it.post_src:
                 it.cache_miss_reason = MISS_POST_SRC_CHANGED
+                it.extra["_cached_post_src"] = cached_post_src
                 it.status = ItemStatus.NONE.value
                 misses.append(it)
                 continue
@@ -440,11 +478,10 @@ def load_project_files(
     proofread_mode: bool = False,
     is_rebuild: bool = False,
 ) -> list[tuple[str, dict[str, Any], list[SentenceItem], list[SentenceItem], list[SentenceItem]]]:
-    """Sweep stale temp files, load `gt_input`, preprocess, and join with `transl_cache`.
+    """Load `gt_input`, preprocess, and join with `transl_cache` without deleting active sibling temp files.
 
     Returns list of `(rel_name, format_meta, all_items, hit_items, miss_items)`.
     """
-    cleanup_stale_cache_temp_files(config.cache_path(project_dir))
     results = []
     for rel_name in input_file_rel_list(project_dir, config, file_patterns):
         fmt_meta, items = load_input_items(project_dir, config, rel_name)
@@ -500,8 +537,10 @@ def append_history_event(
         "change_count": len(changes),
         "changes": changes,
     }
-    with hist_path.open("a", encoding="utf-8") as fp:
-        fp.write(json.dumps(event, ensure_ascii=False) + "\n")
+    with file_lock(project_dir / "work" / ".history.lock"):
+        with hist_path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(event, ensure_ascii=False) + "\n")
+            fp.flush()
     return tid
 
 

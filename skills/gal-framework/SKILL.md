@@ -57,7 +57,7 @@ python gal_cli.py dict --project <project_dir> --kind gpt --action add --src "�
 ```
 - **铁律（凭 `prep-scan` + `sample-debuts` 实证建立三层 `<project_bible>`，严禁白纸盲翻！）**：
   1. **第一层·世界观与戏剧核心**：核实作品发售背景、题材基调与路线核心矛盾。
-  2. **第二层·实证人物关系与声线矩阵**：直接依据 `sample-debuts` 输出的首次登场前后行（`index | speaker | pre_src`）与第一人称/句尾统计（`僕/俺/私/わたし/あーし`、`っす/ですわ/かしら/わね/だぜ/なの/じゃ`），锁定真实身份（如修女/姨甥/姐弟/幼女）、辈分、互称与反差声线。
+  2. **第二层·实证人物关系与声线矩阵**：直接依据 `sample-debuts` 输出的首次登场前后行（`index | speaker | pre_src`）与第一人称/句尾统计（`僕/俺/私/わたし/あーし`、`っす/ですわ/かしら/わね/だぜ/なの/じゃ`），锁定真实身份（如前辈后辈/师徒/青梅竹马/上下级）、辈分、互称与反差声线。
   3. **第三层·剧本家笔触与文体音叉**：明确句法呼吸、吐槽/抒情机制与 H 戏温度美学。
   4. 将浓缩后的三层圣经写入 `project_guideline.md`。
 
@@ -69,19 +69,14 @@ python gal_cli.py make-trial --project <project_dir> --limit 100
 
 ### 阶段 3：Quota-Lean 并发批次生产（轻量自定义 Worker + 短会话上限 + 一步推拉循环）
 
-1. **严禁直接派发臃肿的 `TypeName: "self"` 子代理！**
-   - `self` 会把全套 MCP 工具与长系统提示词每回合重复计费。主控必须**先调用一次 `define_subagent`** 定义超轻量专属翻译器，将精简协议与 `<project_bible>` 一次性固化进 `SystemPrompt`：
-   ```python
-   define_subagent(
-       Name="gal_translator",
-       Description="Lean Galgame batch translator using compact session protocol",
-       EnableWriteTools=True,
-       EnableMCPTools=False,
-       EnableSubagentTools=False,
-       SystemPrompt="<精简翻译宪章 + project_bible + 紧凑补丁规范>",
-   )
+1. **严禁直接派发携带冗余工具链的重型默认子代理！**
+   - 直接继承主控的全套外部插件、长系统提示词与无关工具会在每回合重复计费。主控应**先注册一个超轻量专属翻译子代理（`gal_translator`）**，仅保留最小文件/命令工具权限、关闭多余 MCP 与嵌套派生能力，并将精简翻译宪章、`<project_bible>` 与紧凑补丁规范一次性固化进其系统提示词：
+   ```text
+   Worker Role: gal_translator
+   Tools: minimal file/CLI write tools only (disable extra MCP & nested subagents)
+   System Prompt: <精简翻译宪章 + project_bible + 紧凑补丁规范>
    ```
-   - 随后通过 `invoke_subagent(TypeName="gal_translator", Model="inherit", ...)` 并发派发（配合 `Carbon Low/Medium` 档位）。
+   - 随后按波次并发派发多个轻量 `gal_translator` 实例（配合中低推理预算档位即可）。
 2. **反 `O(T^2)` 短生命周期分片上限（Anti-`O(T^2)` Short-Lived Worker Cap）**：
    - **严禁给单个子代理对话分配 2,000+ 行（50+ 回合）长任务！**
    - 每个 `gal_translator` 子代理分片严格封顶在 **400–600 行（按 120–150 行/批 = 仅 3–4 批，总回合数 `T <= 8`）**，按波次（Wave）派生全新 `gal_translator` 实例。将单会话控制在 `T <= 8` 可彻底消除多轮历史平方级滚雪球（上下文从 `286k` 压至 `< 18k`，削减 `>90%` `cache_read` 开销）！

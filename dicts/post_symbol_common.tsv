@@ -15,10 +15,10 @@ post_jp	「 [and] !"	1^"	「
 post_jp	」 [and] !"	1^"	」
 post_jp	『 [and] !"	1^"	『
 post_jp	』 [and] !"	1^"	』
-pre_jp	《	『	《
-pre_jp	》	』	》
-pre_jp	『	《	『
-pre_jp	』	》	』
+pre_jp	《[and]!『	『	《
+pre_jp	》[and]!』	』	》
+pre_jp	『[and]!《	《	『
+pre_jp	』[and]!》	》	』
 post_jp	「	“	「
 post_jp	」	”	」
 post_jp	『	‘	『
@@ -31,13 +31,6 @@ pre_jp	“	《	“
 pre_jp	”	》	”
 pre_jp	“	‘	“
 pre_jp	”	’	”
-pre_jp	!“	“	
-pre_jp	!”	”	
 pre_jp	!。）	。）	）
 pre_jp	!。。	。。	。
 pre_jp	!**	**	
-
-// === 条件译后词汇兜底示例（演示 [or] / (同上) / ! 语法） ===
-pre_jp	人妻[or]ひとづま	有夫之妇	人妻
-pre_jp	(同上)	已婚妇女	人妻
-pre_jp	!サタン	撒旦	魔王

@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .models import ProjectConfig, SentenceItem
-from .text_preserve import TextPreserver
+from .text_preserve import PLACEHOLDER_RE, TextPreserver
+
+_PLACEHOLDER_SPLIT_RE = re.compile(r"(\ue000[\ue010-\ue01f]+\ue001)")
 
 _VALID_COND_TYPES: dict[str, str] = {
     "pre_jp": "pre_src",
@@ -28,10 +30,9 @@ _CONDITIONAL_NOTE_RE = re.compile(r"^(?:\[条件\]|条件[:：]|仅当|若指)")
 _EXCLUDE_TAG_RE = re.compile(r"\[exclude[:：]([^\]]+)\]", re.IGNORECASE)
 
 _ALLOWED_CJK_NAME_PREFIXES: tuple[str, ...] = ("御", "聖", "故")
+# Kanji suffixes that validly follow a 1-Kanji character name (kana honorifics like さん/くん/ちゃん
+# are naturally permitted because non-Kanji characters fall through to the okurigana check below).
 _ALLOWED_CJK_NAME_SUFFIXES: tuple[str, ...] = (
-    "さん",
-    "くん",
-    "ちゃん",
     "様",
     "氏",
     "殿",
@@ -53,8 +54,6 @@ _ALLOWED_CJK_NAME_SUFFIXES: tuple[str, ...] = (
     "王",
     "君",
     "達",
-    "たち",
-    "ら",
 )
 
 # Verbal/adjectival okurigana stems that mark lexical words rather than 1-Kanji character names.
@@ -63,6 +62,15 @@ _SINGLE_KANJI_NON_NAME_OKURIGANA: dict[str, tuple[str, ...]] = {
     "潤": (
         "う",
         "い",
+        "った",
+        "っている",
+        "っていた",
+        "ってる",
+        "ってた",
+        "ってきた",
+        "ってくる",
+        "ってしまう",
+        "ってしまっ",
         "わない",
         "わず",
         "えば",
@@ -73,6 +81,8 @@ _SINGLE_KANJI_NON_NAME_OKURIGANA: dict[str, tuple[str, ...]] = {
         "んで",
         "まない",
         "めば",
+        "す",
+        "し",
         "した",
         "して",
         "さない",
@@ -92,12 +102,13 @@ _SINGLE_KANJI_NON_NAME_OKURIGANA: dict[str, tuple[str, ...]] = {
         "でさせ",
         "でながら",
     ),
-    "薫": ("る", "り", "った"),
-    "光": ("る", "り", "った", "って"),
-    "舞": ("う", "い", "った"),
-    "響": ("く", "き", "いた", "いて"),
-    "望": ("む", "み", "んだ", "んで"),
-    "願": ("う", "い", "った"),
+    "薫": ("る", "り", "った", "っている", "っていた", "ってる"),
+    "光": ("る", "り", "った", "って", "らない", "らず", "れば", "ろう", "らせる", "らせて"),
+    "舞": ("う", "い", "った", "わない", "わず", "えば", "おう", "っている", "っていた", "ってる"),
+    "響": ("く", "き", "いた", "いて", "かない", "かず", "けば", "こう", "かせる", "かせて"),
+    "望": ("む", "み", "んだ", "んで", "まない", "まず", "めば", "もう", "まれる", "まれ"),
+    "願": ("う", "い", "った", "わない", "わず", "えば", "おう", "っている", "っていた", "ってる"),
+    "遥": ("かな", "かに", "か彼", "か昔", "か遠", "か上", "か下", "か先", "か向", "か高"),
 }
 
 
@@ -160,6 +171,7 @@ class NormalDictRule:
     is_regex: bool = False
     case_sensitive: bool = True
     comment: str = ""
+    source_priority: int = 1
     _compiled: re.Pattern[str] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -174,16 +186,36 @@ class NormalDict:
     def __init__(self, rules: list[NormalDictRule] | None = None) -> None:
         self.rules: list[NormalDictRule] = list(rules or [])
 
-    def load_file(self, path: str | Path) -> int:
+    def load_file(
+        self,
+        path: str | Path,
+        *,
+        priority: int = 1,
+        override_lower_priority: bool = False,
+    ) -> int:
         p = Path(path)
         if not p.exists():
             return 0
         raw_text = p.read_text(encoding="utf-8-sig")
+        before_len = len(self.rules)
         if p.suffix.lower() == ".json":
-            return self._load_json(raw_text)
-        return self.load_tsv_text(raw_text)
+            added = self._load_json(raw_text, priority=priority)
+        else:
+            added = self.load_tsv_text(raw_text, priority=priority)
+        if override_lower_priority and added > 0:
+            new_rules = self.rules[before_len:]
+            uncond_searches = {r.search for r in new_rules if not r.cond_type and not r.is_regex}
+            exact_keys = {(r.search, r.cond_type, r.cond_expr) for r in new_rules}
+            filtered_old: list[NormalDictRule] = []
+            for old in self.rules[:before_len]:
+                if old.source_priority > priority:
+                    if old.search in uncond_searches or (old.search, old.cond_type, old.cond_expr) in exact_keys:
+                        continue
+                filtered_old.append(old)
+            self.rules = filtered_old + new_rules
+        return added
 
-    def _load_json(self, raw_text: str) -> int:
+    def _load_json(self, raw_text: str, *, priority: int = 1) -> int:
         data = json.loads(raw_text)
         if not isinstance(data, list):
             return 0
@@ -210,12 +242,13 @@ class NormalDict:
                     is_regex=is_regex,
                     case_sensitive=bool(item.get("case_sensitive", True)),
                     comment=str(item.get("info", "")),
+                    source_priority=priority,
                 )
             )
             added += 1
         return added
 
-    def load_tsv_text(self, raw_text: str) -> int:
+    def load_tsv_text(self, raw_text: str, *, priority: int = 1) -> int:
         """Parse TSV dictionary lines with comments, prefixes, conditions, and (同上)."""
         added = 0
         prev_cond_type = ""
@@ -264,6 +297,7 @@ class NormalDict:
                         cond_type=cond_type,
                         cond_expr=cond_expr,
                         comment=comment,
+                        source_priority=priority,
                     )
                 )
                 added += 1
@@ -283,6 +317,7 @@ class NormalDict:
                         match_start=match_start,
                         replace_once=replace_once,
                         comment=comment,
+                        source_priority=priority,
                     )
                 )
                 added += 1
@@ -290,8 +325,50 @@ class NormalDict:
         return added
 
     def sort_by_length(self) -> None:
-        """Stable-sort rules by search length descending to prevent short-word hijacking."""
-        self.rules.sort(key=lambda r: len(r.search), reverse=True)
+        """Stable-sort rules by search length descending, with project priority ahead of builtin."""
+        self.rules.sort(key=lambda r: (-len(r.search), r.source_priority))
+
+    @staticmethod
+    def _apply_rule_safe(working: str, rule: NormalDictRule, has_placeholders: bool) -> str:
+        """Apply a single rule while never mutating PUA control/ruby placeholders."""
+        if not has_placeholders:
+            if rule.is_regex and rule._compiled is not None:
+                return rule._compiled.sub(rule.replace, working, count=1 if rule.replace_once else 0)
+            if rule.match_start:
+                return (rule.replace + working[len(rule.search) :]) if working.startswith(rule.search) else working
+            if rule.replace_once:
+                return working.replace(rule.search, rule.replace, 1) if rule.search in working else working
+            return working.replace(rule.search, rule.replace) if rule.search in working else working
+
+        parts = _PLACEHOLDER_SPLIT_RE.split(working)
+        replaced_any = False
+        for i in range(0, len(parts), 2):
+            seg = parts[i]
+            if not seg:
+                continue
+            if rule.match_start:
+                if i == 0 and seg.startswith(rule.search):
+                    parts[0] = rule.replace + seg[len(rule.search) :]
+                break
+            if rule.is_regex and rule._compiled is not None:
+                if rule.replace_once:
+                    new_seg, cnt = rule._compiled.subn(rule.replace, seg, count=1)
+                    if cnt > 0:
+                        parts[i] = new_seg
+                        break
+                else:
+                    parts[i] = rule._compiled.sub(rule.replace, seg)
+            elif rule.replace_once:
+                if rule.search in seg:
+                    parts[i] = seg.replace(rule.search, rule.replace, 1)
+                    replaced_any = True
+                    break
+            else:
+                if rule.search in seg:
+                    parts[i] = seg.replace(rule.search, rule.replace)
+                    replaced_any = True
+        _ = replaced_any
+        return "".join(parts)
 
     def apply(
         self,
@@ -324,6 +401,7 @@ class NormalDict:
             working, local_token_map = preserver.protect_text(working, include_ruby=True)
 
         active_map = local_token_map or (external_token_map or {})
+        has_placeholders = bool(active_map) or bool(PLACEHOLDER_RE.search(working))
 
         for rule in self.rules:
             if rule.cond_type:
@@ -335,20 +413,7 @@ class NormalDict:
                 if not evaluate_condition(rule.cond_expr, target_field):
                     continue
 
-            if rule.is_regex and rule._compiled is not None:
-                count = 1 if rule.replace_once else 0
-                working = rule._compiled.sub(rule.replace, working, count=count)
-                continue
-
-            if rule.match_start:
-                if working.startswith(rule.search):
-                    working = rule.replace + working[len(rule.search) :]
-            elif rule.replace_once:
-                if rule.search in working:
-                    working = working.replace(rule.search, rule.replace, 1)
-            else:
-                if rule.search in working:
-                    working = working.replace(rule.search, rule.replace)
+            working = self._apply_rule_safe(working, rule, has_placeholders)
 
         if local_token_map:
             working, _ = TextPreserver.restore_text(working, local_token_map)
@@ -510,7 +575,7 @@ class GptDict:
         if not orig_text or not entry.src:
             return False, working_mask
 
-        # Context-level exclusions (where exclusion string does not contain entry.src)
+        # Context-level exclusions (respect case_sensitive and upstream working_mask)
         local_mask = working_mask
         for ex in entry.exclude_if:
             if not ex:
@@ -522,7 +587,8 @@ class GptDict:
                 else:
                     local_mask = re.compile(re.escape(ex), re.IGNORECASE).sub("\x00" * len(ex), local_mask)
             else:
-                if ex in orig_text:
+                ex_found = (ex in working_mask) if entry.case_sensitive else (ex.lower() in working_mask.lower())
+                if ex_found:
                     return False, working_mask
 
         is_single_cjk = len(entry.src) == 1 and _is_cjk_ideograph(entry.src)
@@ -546,17 +612,18 @@ class GptDict:
                 chars[idx] = "\x00"
             return True, "".join(chars)
 
-        haystack = local_mask if entry.case_sensitive else local_mask.lower()
-        needle = entry.src if entry.case_sensitive else entry.src.lower()
-        if not needle or needle not in haystack:
+        flags = 0 if entry.case_sensitive else re.IGNORECASE
+        pat = re.compile(re.escape(entry.src), flags)
+        matched_spans = [m.span() for m in pat.finditer(local_mask)]
+        if not matched_spans:
             return False, working_mask
 
-        if entry.case_sensitive:
-            updated = working_mask.replace(entry.src, "\x00" * len(entry.src))
-        else:
-            pat = re.compile(re.escape(entry.src), re.IGNORECASE)
-            updated = pat.sub("\x00" * len(entry.src), working_mask)
-        return True, updated
+        # Mask ONLY positions matched in local_mask so excluded compounds remain intact for shorter terms
+        chars = list(working_mask)
+        for s_pos, e_pos in matched_spans:
+            for k in range(s_pos, e_pos):
+                chars[k] = "\x00"
+        return True, "".join(chars)
 
     def match_batch(
         self,
@@ -618,11 +685,13 @@ class GptDict:
         misses: list[str] = []
 
         for entry in ordered:
-            hit, masked_src = self._entry_hits_text(entry, src_text, masked_src)
+            hit, next_mask = self._entry_hits_text(entry, src_text, masked_src)
             if not hit:
                 continue
             if entry.conditional:
+                # Conditional (unchecked) terms must NOT shadow shorter unconditional terms
                 continue
+            masked_src = next_mask
 
             variants = entry.dst_variants()
             used = any(
@@ -657,10 +726,15 @@ def load_project_dicts(
     config: ProjectConfig,
     project_dir: Path,
 ) -> tuple[NormalDict, GptDict, NormalDict]:
-    """Load and optionally length-sort pre_dict, gpt_dict (project overrides builtin), and post_dict."""
+    """Load and optionally length-sort pre_dict, gpt_dict, and post_dict (project overrides builtin)."""
     pre_dict = NormalDict()
     for ref in config.pre_dicts:
-        pre_dict.load_file(config.resolve_resource_path(ref, project_dir))
+        is_proj = not ref.startswith("builtin:")
+        pre_dict.load_file(
+            config.resolve_resource_path(ref, project_dir),
+            priority=0 if is_proj else 1,
+            override_lower_priority=is_proj,
+        )
     if config.sort_dicts:
         pre_dict.sort_by_length()
 
@@ -672,7 +746,12 @@ def load_project_dicts(
 
     post_dict = NormalDict()
     for ref in config.post_dicts:
-        post_dict.load_file(config.resolve_resource_path(ref, project_dir))
+        is_proj = not ref.startswith("builtin:")
+        post_dict.load_file(
+            config.resolve_resource_path(ref, project_dir),
+            priority=0 if is_proj else 1,
+            override_lower_priority=is_proj,
+        )
     if config.sort_dicts:
         post_dict.sort_by_length()
 

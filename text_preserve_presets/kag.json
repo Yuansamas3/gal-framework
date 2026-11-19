@@ -4,7 +4,7 @@
     "info": "KAG/吉里吉里常用无参控制标签 [l] [r] [p] [cm]"
   },
   {
-    "src": "\\[[A-Za-z_][A-Za-z0-9_]*(?:\\s+[^\\]\\r\\n\\u4e00-\\u9fff\\u3040-\\u309f\\u30a0-\\u30ff\\uac00-\\ud7af]+)?\\]",
+    "src": "\\[(?!ruby\\b)[A-Za-z_][A-Za-z0-9_]*(?:\\s+[^\\]\\r\\n\\u4e00-\\u9fff\\u3040-\\u309f\\u30a0-\\u30ff\\uac00-\\ud7af]+)?\\]",
     "info": "KAG 带参标签 [wait time=200] [font size=24] [emb exp=\"f.name\"]"
   },
   {

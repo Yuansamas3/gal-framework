@@ -8,8 +8,11 @@ from typing import Any, Sequence
 
 from adapters import export_file
 from .cache_ledger import (
+    MISS_POST_SRC_CHANGED,
     append_history_event,
+    cleanup_stale_cache_temp_files,
     load_project_files,
+    project_ledger_lock,
     read_history_events,
     save_cache_file,
     snapshot_item_fields,
@@ -68,71 +71,102 @@ def rebuild_project(
     pre_dict, gpt_dict, post_dict = load_project_dicts(config, project_dir)
     preserver = TextPreserver.from_project(config, project_dir)
 
-    loaded = load_project_files(
-        project_dir,
-        config,
-        pre_dict=pre_dict,
-        file_patterns=file_patterns,
-        ignore_post_src=ignore_post_src,
-        is_rebuild=True,
-    )
+    with project_ledger_lock(project_dir):
+        cleanup_stale_cache_temp_files(config.cache_path(project_dir), min_age_seconds=300.0)
+        loaded = load_project_files(
+            project_dir,
+            config,
+            pre_dict=pre_dict,
+            file_patterns=file_patterns,
+            ignore_post_src=ignore_post_src,
+            is_rebuild=True,
+        )
 
-    before_problem_items = 0
-    after_problem_items = 0
-    total_items = 0
-    total_hits = 0
-    total_misses = 0
-    rebuilt_translated = 0
-    miss_reasons: Counter[str] = Counter()
-    miss_details: list[dict[str, Any]] = []
-    type_counter: Counter[str] = Counter()
-    export_payload: list[tuple[str, dict[str, Any], list[Any]]] = []
+        before_problem_items = 0
+        after_problem_items = 0
+        total_items = 0
+        total_hits = 0
+        total_misses = 0
+        rebuilt_translated = 0
+        miss_reasons: Counter[str] = Counter()
+        miss_details: list[dict[str, Any]] = []
+        type_counter: Counter[str] = Counter()
+        export_payload: list[tuple[str, dict[str, Any], list[Any]]] = []
 
-    for rel_name, fmt_meta, items, hits, misses in loaded:
-        total_items += len(items)
-        total_hits += len(hits)
-        total_misses += len(misses)
-        before_problem_items += sum(1 for it in items if it.problems)
+        for rel_name, fmt_meta, items, hits, misses in loaded:
+            total_items += len(items)
+            total_hits += len(hits)
+            total_misses += len(misses)
+            before_problem_items += sum(1 for it in items if it.problems)
 
-        for m in misses:
-            miss_reasons[m.cache_miss_reason or "unknown"] += 1
-            if len(miss_details) < 50:
-                miss_details.append(
-                    {
-                        "file": rel_name,
-                        "id": m.index,
-                        "reason": m.cache_miss_reason,
-                        "post_src": m.post_src,
-                    }
-                )
+            for m in misses:
+                miss_reasons[m.cache_miss_reason or "unknown"] += 1
+                if len(miss_details) < 50:
+                    miss_details.append(
+                        {
+                            "file": rel_name,
+                            "id": m.index,
+                            "reason": m.cache_miss_reason,
+                            "post_src": m.post_src,
+                        }
+                    )
 
-        for it in items:
-            if it.speaker and it.speaker in config.speaker_map:
-                it.speaker_dst = config.speaker_map[it.speaker]
-            if it.effective_core_dst != "":
-                normalize_and_restore_dst(it, config, post_dict=post_dict, preserver=preserver)
-                check_item_problems(
-                    it,
-                    config,
-                    profile=profile,
-                    preserver=preserver,
-                    gpt_dict=gpt_dict,
-                )
-                rebuilt_translated += 1
-            else:
-                it.problems = []
+            for it in items:
+                if it.speaker:
+                    if it.speaker in config.speaker_map:
+                        it.speaker_dst = config.speaker_map[it.speaker]
+                    elif it.proofread_by != "editor":
+                        it.speaker_dst = ""
+                    if config.use_post_dict_in_name and post_dict.rules:
+                        base_name = it.speaker_dst or it.speaker
+                        if base_name:
+                            it.speaker_dst = post_dict.apply(base_name, it, preserver=preserver)
 
-            if it.problems:
-                after_problem_items += 1
-                for p in it.problems:
-                    type_counter[p.split("：", 1)[0]] += 1
+                if not ignore_post_src and it.cache_miss_reason == MISS_POST_SRC_CHANGED:
+                    # Keep post_src_changed miss intact so subsequent `batch-pull --only-miss` retranslates it
+                    if it.problems:
+                        after_problem_items += 1
+                        for p in it.problems:
+                            type_counter[p.split("：", 1)[0]] += 1
+                    continue
 
-        save_cache_file(project_dir, config, rel_name, items)
-        export_payload.append((rel_name, fmt_meta, items))
+                if it.effective_core_dst != "":
+                    normalize_and_restore_dst(it, config, post_dict=post_dict, preserver=preserver)
+                    check_item_problems(
+                        it,
+                        config,
+                        profile=profile,
+                        preserver=preserver,
+                        gpt_dict=gpt_dict,
+                    )
+                    rebuilt_translated += 1
+                else:
+                    it.problems = []
 
-    output_files: list[str] = []
-    if refresh_output and export_payload:
-        output_files = export_project_outputs(project_dir, config, export_payload)
+                if it.problems:
+                    after_problem_items += 1
+                    for p in it.problems:
+                        type_counter[p.split("：", 1)[0]] += 1
+
+            save_cache_file(
+                project_dir,
+                config,
+                rel_name,
+                items,
+                preserve_miss_post_src=not ignore_post_src,
+            )
+            export_payload.append((rel_name, fmt_meta, items))
+
+        output_files: list[str] = []
+        export_errors: list[str] = []
+        if refresh_output and export_payload:
+            for rel_name, fmt_meta, items in export_payload:
+                try:
+                    output_files.extend(
+                        export_project_outputs(project_dir, config, [(rel_name, fmt_meta, items)])
+                    )
+                except UnicodeEncodeError as exc:
+                    export_errors.append(f"{rel_name}: encoding error ({exc})")
 
     return {
         "files_rebuilt": len(loaded),
@@ -147,6 +181,7 @@ def rebuild_project(
         "delta": after_problem_items - before_problem_items,
         "by_type": [{"type": k, "count": v} for k, v in type_counter.most_common()],
         "output_files": output_files,
+        "export_errors": export_errors,
     }
 
 
@@ -172,72 +207,83 @@ def revert_task(
     pre_dict, gpt_dict, post_dict = load_project_dicts(config, project_dir)
     preserver = TextPreserver.from_project(config, project_dir)
 
-    changes_by_file: dict[str, list[dict[str, Any]]] = {}
-    for ch in target_event.get("changes", []):
-        fname = str(ch.get("file", ""))
-        if fname:
-            changes_by_file.setdefault(fname, []).append(ch)
+    with project_ledger_lock(project_dir):
+        changes_by_file: dict[str, list[dict[str, Any]]] = {}
+        for ch in target_event.get("changes", []):
+            fname = str(ch.get("file", "")).replace("\\", "/")
+            if fname:
+                changes_by_file.setdefault(fname, []).append(ch)
 
-    loaded = load_project_files(
-        project_dir,
-        config,
-        pre_dict=pre_dict,
-        file_patterns=list(changes_by_file.keys()),
-        ignore_post_src=True,
-    )
+        loaded = load_project_files(
+            project_dir,
+            config,
+            pre_dict=pre_dict,
+            file_patterns=list(changes_by_file.keys()),
+            ignore_post_src=True,
+        )
 
-    reverted_records: list[dict[str, Any]] = []
-    export_payload: list[tuple[str, dict[str, Any], list[Any]]] = []
+        reverted_records: list[dict[str, Any]] = []
+        export_payload: list[tuple[str, dict[str, Any], list[Any]]] = []
 
-    for rel_name, fmt_meta, items, _hits, _misses in loaded:
-        by_idx = {it.index: it for it in items}
-        for ch in changes_by_file.get(rel_name, []):
-            idx = int(ch["index"])
-            it = by_idx.get(idx)
-            if it is None:
+        for rel_name, fmt_meta, items, _hits, _misses in loaded:
+            file_changes = changes_by_file.get(rel_name)
+            if not file_changes:
                 continue
-            before_now = snapshot_item_fields(it)
-            prev_snap = ch.get("before", {})
-            it.pre_dst = str(prev_snap.get("pre_dst", ""))
-            it.proofread_dst = str(prev_snap.get("proofread_dst", ""))
-            it.speaker_dst = str(prev_snap.get("speaker_dst", ""))
-            it.trans_by = str(prev_snap.get("trans_by", ""))
-            it.proofread_by = str(prev_snap.get("proofread_by", ""))
-            it.proofread_comment = str(prev_snap.get("proofread_comment", ""))
-            it.skip_check = bool(prev_snap.get("skip_check", False))
+            by_idx = {it.index: it for it in items}
+            # Reverse order ensures duplicate index edits within a single task unwind to the true original state
+            for ch in reversed(file_changes):
+                idx = int(ch["index"])
+                it = by_idx.get(idx)
+                if it is None:
+                    continue
+                before_now = snapshot_item_fields(it)
+                prev_snap = ch.get("before", {})
+                it.pre_dst = str(prev_snap.get("pre_dst", ""))
+                it.proofread_dst = str(prev_snap.get("proofread_dst", ""))
+                it.speaker_dst = str(prev_snap.get("speaker_dst", ""))
+                it.trans_by = str(prev_snap.get("trans_by", ""))
+                it.proofread_by = str(prev_snap.get("proofread_by", ""))
+                it.proofread_comment = str(prev_snap.get("proofread_comment", ""))
+                it.skip_check = bool(prev_snap.get("skip_check", False))
 
-            if it.effective_core_dst != "":
-                it.status = ItemStatus.PROOFREAD.value if it.proofread_dst else ItemStatus.PROCESSED.value
-                normalize_and_restore_dst(it, config, post_dict=post_dict, preserver=preserver)
-                check_item_problems(it, config, profile=profile, preserver=preserver, gpt_dict=gpt_dict)
-            else:
-                it.status = ItemStatus.NONE.value
-                it.post_dst = ""
-                it.problems = []
+                if it.effective_core_dst != "":
+                    it.status = ItemStatus.PROOFREAD.value if it.proofread_dst else ItemStatus.PROCESSED.value
+                    normalize_and_restore_dst(it, config, post_dict=post_dict, preserver=preserver)
+                    check_item_problems(it, config, profile=profile, preserver=preserver, gpt_dict=gpt_dict)
+                else:
+                    it.status = ItemStatus.NONE.value
+                    it.post_dst = ""
+                    it.problems = []
 
-            reverted_records.append(
-                {
-                    "file": rel_name,
-                    "index": idx,
-                    "before": before_now,
-                    "after": snapshot_item_fields(it),
-                }
-            )
+                reverted_records.append(
+                    {
+                        "file": rel_name,
+                        "index": idx,
+                        "before": before_now,
+                        "after": snapshot_item_fields(it),
+                    }
+                )
 
-        save_cache_file(project_dir, config, rel_name, items)
-        export_payload.append((rel_name, fmt_meta, items))
+            save_cache_file(project_dir, config, rel_name, items)
+            export_payload.append((rel_name, fmt_meta, items))
 
-    revert_tid = append_history_event(
-        project_dir,
-        config,
-        action="revert",
-        reason=f"revert {task_id}",
-        changes=reverted_records,
-    )
+        revert_tid = append_history_event(
+            project_dir,
+            config,
+            action="revert",
+            reason=f"revert {task_id}",
+            changes=reverted_records,
+        )
 
-    output_files: list[str] = []
-    if refresh_output and export_payload:
-        output_files = export_project_outputs(project_dir, config, export_payload)
+        output_files: list[str] = []
+        if refresh_output and export_payload:
+            for rel_name, fmt_meta, items in export_payload:
+                try:
+                    output_files.extend(
+                        export_project_outputs(project_dir, config, [(rel_name, fmt_meta, items)])
+                    )
+                except UnicodeEncodeError:
+                    pass
 
     return {
         "status": "reverted",

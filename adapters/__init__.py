@@ -21,8 +21,16 @@ def get_adapter(fmt: str):
     return ADAPTERS[fmt]
 
 
-def import_path(fmt: str, input_path: Path) -> list[tuple[str, dict[str, Any], list[SentenceItem]]]:
-    return get_adapter(fmt).import_path(input_path)
+def import_path(
+    fmt: str,
+    input_path: Path,
+    *,
+    pipe_style: str = "auto",
+) -> list[tuple[str, dict[str, Any], list[SentenceItem]]]:
+    adapter = get_adapter(fmt)
+    if fmt == "compact_pipe":
+        return adapter.import_path(input_path, pipe_style=pipe_style)
+    return adapter.import_path(input_path)
 
 
 def export_file(

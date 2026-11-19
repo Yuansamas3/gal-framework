@@ -5,16 +5,51 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Sequence
 
-from core.models import SentenceItem
+from core.models import SentenceItem, atomic_write_text
+
+_KNOWN_CONTROL_BRACKET_TAGS: frozenset[str] = frozenset(
+    {
+        "l",
+        "r",
+        "p",
+        "cm",
+        "er",
+        "ct",
+        "lr",
+        "np",
+        "k",
+        "x",
+        "・",
+        "resetfont",
+        "resetstyle",
+        "endruby",
+        "endindent",
+        "indent",
+    }
+)
 
 
-def _parse_compact_line(line: str) -> tuple[str, str, str, str] | None:
+def _is_bracket_speaker_tag(spk: str) -> bool:
+    if not spk or len(spk) > 32:
+        return False
+    if any(ch in spk for ch in ("|", ",", "=", " ", "\t")):
+        return False
+    if spk.lower() in _KNOWN_CONTROL_BRACKET_TAGS:
+        return False
+    return True
+
+
+def _parse_compact_line(
+    line: str,
+    *,
+    pipe_style: str = "auto",
+) -> tuple[str, str, str, str] | None:
     """Parse a non-comment compact-pipe line into (raw_id, speaker, text, speaker_style).
 
-    Supported formats:
+    Supported formats (`pipe_style` = 'auto' | 'pipe' | 'bracket' | 'plain'):
       - `ID|spk|text`    -> speaker_style = "pipe"
       - `ID||text`       -> speaker_style = "pipe" (empty speaker)
-      - `ID|[spk]text`   -> speaker_style = "bracket" (when `[spk]` precedes a dialogue quote, not inline furigana)
+      - `ID|[spk]text`   -> speaker_style = "bracket" (when `[spk]` precedes a dialogue quote, not inline furigana/control)
       - `ID|text`        -> speaker_style = "plain"
     """
     if "|" not in line:
@@ -23,32 +58,61 @@ def _parse_compact_line(line: str) -> tuple[str, str, str, str] | None:
     if not raw_id.strip():
         return None
 
-    # Format B: `ID|spk|text` or `ID||text`
-    if "|" in rest:
-        spk_cand, text_cand = rest.split("|", 1)
-        if not any(q in spk_cand for q in ("「", "『", "“", "（")):
-            return raw_id, spk_cand, text_cand, "pipe"
+    style_mode = (pipe_style or "auto").lower()
 
-    # Format A: `ID|[spk]text` (distinguished from inline KAG/M2 furigana `[・]text` or `[クィーン]Ｑ` by trailing dialogue quote)
+    if style_mode == "plain":
+        return raw_id, "", rest, "plain"
+
+    if style_mode == "pipe":
+        if "|" in rest:
+            spk_cand, text_cand = rest.split("|", 1)
+            return raw_id, spk_cand, text_cand, "pipe"
+        return raw_id, "", rest, "plain"
+
+    if style_mode == "bracket":
+        if rest.startswith("["):
+            close_idx = rest.find("]")
+            if close_idx > 0:
+                spk = rest[1:close_idx]
+                after = rest[close_idx + 1 :]
+                if _is_bracket_speaker_tag(spk):
+                    return raw_id, spk, after, "bracket"
+        return raw_id, "", rest, "plain"
+
+    # Auto mode:
+    # 1) Check Format A (`ID|[spk]text`) BEFORE Format B so `[遥]"text\|more"` is never sliced on `\|`
+    #    (distinguished from inline KAG/M2 furigana `[・]text`, `[l]「...」`, or `[ルビ]漢字` by tag filter & dialogue quote)
     if rest.startswith("["):
         close_idx = rest.find("]")
         if close_idx > 0:
             spk = rest[1:close_idx]
             after = rest[close_idx + 1 :]
-            if (
-                "|" not in spk
-                and "," not in spk
-                and "=" not in spk
-                and spk != "・"
-                and after.lstrip().startswith(("「", "『", "“", "\"", "（", "("))
+            if _is_bracket_speaker_tag(spk) and after.lstrip().startswith(
+                ("「", "『", "“", "\"", "（", "(")
             ):
                 return raw_id, spk, after, "bracket"
 
-    # Format C: `ID|text`
+    # 2) Format B: `ID|spk|text` or `ID||text` (guard against escaped `\|` control codes and prose sentences)
+    if "|" in rest:
+        spk_cand, text_cand = rest.split("|", 1)
+        if (
+            len(spk_cand) <= 32
+            and not spk_cand.endswith("\\")
+            and "\\" not in spk_cand
+            and not any(q in spk_cand for q in ("「", "『", "“", "\"", "（", "(", "。", "！", "？", "、", "，"))
+        ):
+            return raw_id, spk_cand, text_cand, "pipe"
+
+    # 3) Format C: `ID|text`
     return raw_id, "", rest, "plain"
 
 
-def import_file(file_path: Path, rel_name: str) -> tuple[str, dict[str, Any], list[SentenceItem]]:
+def import_file(
+    file_path: Path,
+    rel_name: str,
+    *,
+    pipe_style: str = "auto",
+) -> tuple[str, dict[str, Any], list[SentenceItem]]:
     """Import a compact-pipe text file while recording full line layout for lossless export."""
     raw_content = file_path.read_text(encoding="utf-8-sig")
     trailing_newline = raw_content.endswith("\n")
@@ -64,7 +128,7 @@ def import_file(file_path: Path, rel_name: str) -> tuple[str, dict[str, Any], li
             layout.append({"kind": "raw", "line": raw_line})
             continue
 
-        parsed = _parse_compact_line(raw_line)
+        parsed = _parse_compact_line(raw_line, pipe_style=pipe_style)
         if parsed is None:
             layout.append({"kind": "raw", "line": raw_line})
             continue
@@ -92,10 +156,14 @@ def import_file(file_path: Path, rel_name: str) -> tuple[str, dict[str, Any], li
     return rel_name, meta, items
 
 
-def import_path(input_path: Path) -> list[tuple[str, dict[str, Any], list[SentenceItem]]]:
+def import_path(
+    input_path: Path,
+    *,
+    pipe_style: str = "auto",
+) -> list[tuple[str, dict[str, Any], list[SentenceItem]]]:
     """Import a single compact-pipe file or all `.txt`/`.tsv`/`.pipe` files under a directory."""
     if input_path.is_file():
-        return [import_file(input_path, input_path.name)]
+        return [import_file(input_path, input_path.name, pipe_style=pipe_style)]
     if not input_path.is_dir():
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
@@ -104,7 +172,7 @@ def import_path(input_path: Path) -> list[tuple[str, dict[str, Any], list[Senten
     for p in sorted(input_path.rglob("*")):
         if p.is_file() and p.suffix.lower() in exts:
             rel = p.relative_to(input_path).as_posix()
-            results.append(import_file(p, rel))
+            results.append(import_file(p, rel, pipe_style=pipe_style))
     return results
 
 
@@ -165,5 +233,5 @@ def export_file(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     enc = "gbk" if encoding.lower() in ("gbk", "gb2312", "cp936") else "utf-8"
-    output_path.write_text(content, encoding=enc, errors="strict")
+    atomic_write_text(output_path, content, encoding=enc, errors="strict")
     return output_path

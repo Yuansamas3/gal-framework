@@ -14,11 +14,12 @@ from .cache_ledger import (
     append_history_event,
     atomic_write_json,
     load_project_files,
+    project_ledger_lock,
     save_cache_file,
     snapshot_item_fields,
 )
 from .dictionary import GptDict, inject_glossary_for_batch, load_project_dicts
-from .models import ItemStatus, ProjectConfig, SentenceItem
+from .models import ItemStatus, ProjectConfig, SentenceItem, file_lock
 from .normalizer import normalize_and_restore_dst
 from .problems import check_item_problems, problem_severity, split_problems_by_severity
 from .rebuilder import export_project_outputs
@@ -33,8 +34,36 @@ def _is_int_token(val: str) -> bool:
 
 
 def _sanitize_session_id(session_id: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", session_id.strip()).strip("._")
-    return cleaned or "session"
+    raw = session_id.strip()
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._")
+    if not cleaned:
+        return "session"
+    if cleaned != raw:
+        suffix = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
+        return f"{cleaned}_{suffix}"
+    return cleaned
+
+
+def _session_file_path(project_dir: Path, session_id: str) -> Path:
+    return project_dir / "work" / ".sessions" / f"{_sanitize_session_id(session_id)}.json"
+
+
+def _load_session_state(project_dir: Path, session_id: str) -> dict[str, Any]:
+    sfile = _session_file_path(project_dir, session_id)
+    if not sfile.exists():
+        return {}
+    try:
+        data = json.loads(sfile.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_session_state(project_dir: Path, session_id: str, state: dict[str, Any]) -> None:
+    sfile = _session_file_path(project_dir, session_id)
+    lock_path = sfile.with_suffix(".lock")
+    with file_lock(lock_path):
+        atomic_write_json(sfile, state)
 
 
 def _extract_guideline_digest(config: ProjectConfig, project_dir: Path, profile: dict[str, Any]) -> str:
@@ -77,19 +106,15 @@ def _extract_guideline_digest(config: ProjectConfig, project_dir: Path, profile:
     return "\n".join(lines)
 
 
-def _render_src_for_prompt(item: SentenceItem) -> str:
-    text = item.post_src
-    if "\r\n" in text:
-        text = text.replace("\r\n", "<br>")
-    elif "\n" in text:
-        text = text.replace("\n", "<br>")
-    return text.replace("|", "\\|")
+def _render_src_for_prompt(item: SentenceItem, *, escape_pipe: bool = True) -> str:
+    text = item.post_src.replace("\r\n", "<br>").replace("\n", "<br>")
+    return text.replace("|", "\\|") if escape_pipe else text
 
 
-def _render_dst_for_context(item: SentenceItem) -> str:
+def _render_dst_for_context(item: SentenceItem, *, escape_pipe: bool = True) -> str:
     text = item.post_dst or item.post_src or item.pre_src
     text = text.replace("\r\n", "<br>").replace("\n", "<br>")
-    return text.replace("|", "\\|")
+    return text.replace("|", "\\|") if escape_pipe else text
 
 
 def pull_batch(
@@ -174,7 +199,7 @@ def pull_batch(
                             "file": cit.file_name,
                             "id": cit.index,
                             "speaker": cit.speaker_dst or cit.speaker,
-                            "text": _render_dst_for_context(cit),
+                            "text": _render_dst_for_context(cit, escape_pipe=not use_compact),
                         }
                     )
             prev_file = file_name
@@ -197,15 +222,8 @@ def pull_batch(
     rendered_guideline_anchor = guideline_digest
 
     if sid:
-        session_file = project_dir / "work" / ".sessions" / f"{_sanitize_session_id(sid)}.json"
-        prev_hash = ""
-        if session_file.exists():
-            try:
-                sess_data = json.loads(session_file.read_text(encoding="utf-8-sig"))
-                if isinstance(sess_data, dict):
-                    prev_hash = str(sess_data.get("bible_hash", ""))
-            except (OSError, json.JSONDecodeError):
-                prev_hash = ""
+        sess_data = _load_session_state(project_dir, sid)
+        prev_hash = str(sess_data.get("bible_hash", ""))
         if prev_hash == bible_hash:
             bible_deduplicated = True
             header_line = guideline_digest.splitlines()[0] if guideline_digest else ""
@@ -215,10 +233,9 @@ def pull_batch(
                 + (f"\n{header_line}" if header_line else "")
             )
         else:
-            atomic_write_json(
-                session_file,
-                {"session_id": sid, "bible_hash": bible_hash},
-            )
+            sess_data["session_id"] = sid
+            sess_data["bible_hash"] = bible_hash
+            _save_session_state(project_dir, sid, sess_data)
 
     md_lines: list[str] = [
         f"# Work-Unit ({len(selected_items)} items | remaining={max(0, total_matching - offset - len(selected_items))})",
@@ -267,7 +284,7 @@ def pull_batch(
     input_records: list[dict[str, Any]] = []
     cur_in_file = None
     for it in selected_items:
-        rendered_src = _render_src_for_prompt(it)
+        rendered_src = _render_src_for_prompt(it, escape_pipe=not use_compact)
         spk_col = it.speaker.replace("|", "\\|") if it.speaker else "-"
         suffix = ""
         if it.problems and retransl_problems:
@@ -443,6 +460,23 @@ class PatchEntry:
     speaker_dst: str = ""
     comment: str = ""
     raw_header: str = ""
+    ambiguous_numeric_anchor: bool = False
+    alt_index: int | None = None
+    alt_dst: str = ""
+
+
+def _is_jsonl_object_text(s: str) -> bool:
+    """Return True iff `s` parses as a JSON object looking like a patch record."""
+    st = s.strip()
+    if not (st.startswith("{") and st.endswith("}")):
+        return False
+    try:
+        obj = json.loads(st)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(obj, dict) and any(
+        k in obj for k in ("id", "index", "dst", "message", "translation")
+    )
 
 
 def _parse_header_spec(header: str, current_file: str = "") -> tuple[str, int | None, str]:
@@ -468,27 +502,39 @@ def _parse_header_spec(header: str, current_file: str = "") -> tuple[str, int | 
     return spec, None, ""
 
 
-def _try_parse_compact_entry_line(raw_ln: str, current_file: str) -> PatchEntry | None:
-    """Parse `<id>|<dst>` or `<anchor>|<id>|<dst>`, preserving any `|` inside `<dst>`."""
+def _try_parse_compact_entry_line(
+    raw_ln: str,
+    current_file: str,
+    *,
+    allow_brace_dst: bool = False,
+) -> PatchEntry | None:
+    """Parse `<id>|<dst>` or `<anchor>|<id>|<dst>`, preserving `|` and `{...}` inside `<dst>`."""
     line = raw_ln.rstrip("\r\n").lstrip()
     if "|" not in line:
         return None
     first, rest = line.split("|", 1)
     f_clean = first.strip().strip("`").strip()
 
+    if not allow_brace_dst and _is_jsonl_object_text(rest):
+        return None
+
     if "|" in rest:
         second, third = rest.split("|", 1)
         s_clean = second.strip().strip("`").strip()
-        if _ANCHOR_RE.match(f_clean) and _is_int_token(s_clean):
+        if _ANCHOR_RE.match(f_clean) and _is_int_token(s_clean) and int(s_clean) > 0:
+            ambiguous = f_clean.isdigit()
             return PatchEntry(
                 file_name=current_file,
                 index=int(s_clean),
                 anchor=f_clean,
                 dst=third,
                 raw_header=line[:80],
+                ambiguous_numeric_anchor=ambiguous,
+                alt_index=int(f_clean) if ambiguous else None,
+                alt_dst=rest if ambiguous else "",
             )
 
-    if _is_int_token(f_clean) and not rest.lstrip().startswith("{"):
+    if _is_int_token(f_clean):
         return PatchEntry(
             file_name=current_file,
             index=int(f_clean),
@@ -594,19 +640,28 @@ def parse_patch_text(raw_text: str) -> tuple[list[PatchEntry], list[str]]:
                 if raw_ln.startswith("+"):
                     cur_dst_lines.append(raw_ln[1:])
                     continue
+                if raw_ln.lstrip().startswith("+"):
+                    cur_dst_lines.append(raw_ln.lstrip()[1:])
+                    continue
                 if stripped.startswith("@name:"):
                     cur_spk = stripped[len("@name:") :].strip()
                     continue
                 if stripped.startswith("@comment:"):
                     cur_comment = stripped[len("@comment:") :].strip()
                     continue
-                if raw_ln.startswith("="):
-                    cur_spk = raw_ln[1:].strip()
+                if raw_ln.lstrip().startswith("="):
+                    cur_spk = raw_ln.lstrip()[1:].strip()
                     continue
-                compact_in_block = _try_parse_compact_entry_line(raw_ln, current_file)
+                compact_in_block = _try_parse_compact_entry_line(
+                    raw_ln, current_file, allow_brace_dst=True
+                )
                 if compact_in_block is not None:
                     _flush()
                     entries.append(compact_in_block)
+                    continue
+                errors.append(
+                    f"unexpected line inside @@ {cur_header} block (missing '+' prefix?): {stripped[:80]}"
+                )
                 continue
 
             if stripped.startswith("@name:") and entries:
@@ -615,7 +670,9 @@ def parse_patch_text(raw_text: str) -> tuple[list[PatchEntry], list[str]]:
             if stripped.startswith("@comment:") and entries:
                 entries[-1].comment = stripped[len("@comment:") :].strip()
                 continue
-            compact_entry = _try_parse_compact_entry_line(raw_ln, current_file)
+            compact_entry = _try_parse_compact_entry_line(
+                raw_ln, current_file, allow_brace_dst=True
+            )
             if compact_entry is not None:
                 entries.append(compact_entry)
             else:
@@ -629,8 +686,8 @@ def parse_patch_text(raw_text: str) -> tuple[list[PatchEntry], list[str]]:
         s = raw_ln.strip()
         if not s or s.startswith("```") or s.startswith(("#", "//")):
             continue
-        if "{" not in s:
-            compact_bare = _try_parse_compact_entry_line(raw_ln, "")
+        if not s.startswith("{"):
+            compact_bare = _try_parse_compact_entry_line(raw_ln, "", allow_brace_dst=False)
             if compact_bare is not None:
                 entries.append(compact_bare)
                 continue
@@ -665,16 +722,24 @@ def parse_patch_text(raw_text: str) -> tuple[list[PatchEntry], list[str]]:
 
 
 def _build_delta_repair_unit(
-    hard_error_items: list[dict[str, Any]],
+    repair_items: list[dict[str, Any]],
     parse_or_target_errors: list[str],
     *,
     use_compact: bool = True,
+    is_warn_spike: bool = False,
 ) -> dict[str, Any]:
-    """Build a Circuit-Breaker Delta Repair Work-Unit containing ONLY failed items from the current push."""
+    """Build a Circuit-Breaker Delta Repair Work-Unit containing ONLY failed/spiked items."""
+    kind_label = "soft-warning spike" if is_warn_spike else "hard-error"
+    tag_label = "SOFT_WARNINGS" if is_warn_spike else "HARD_ERRORS"
+    notice = (
+        "单批软告警比率超标，已阻断翻页！请精简/修正以下告警条目后再继续："
+        if is_warn_spike
+        else "存在硬性 QA 错误或补丁定位错误，已阻断翻页！请仅修复并重新提交以下条目："
+    )
     md_lines: list[str] = [
-        f"# CIRCUIT-BREAKER: Delta Repair Work-Unit ({len(hard_error_items)} hard-error item(s) | Advance BLOCKED)",
+        f"# CIRCUIT-BREAKER: Delta Repair Work-Unit ({len(repair_items)} {kind_label} item(s) | Advance BLOCKED)",
         "",
-        "存在硬性 QA 错误或补丁定位错误，已阻断翻页！请仅修复并重新提交以下条目：",
+        notice,
     ]
     if parse_or_target_errors:
         md_lines.extend(["", "<patch_errors>"])
@@ -682,24 +747,24 @@ def _build_delta_repair_unit(
             md_lines.append(f"- {err}")
         md_lines.append("</patch_errors>")
 
-    if hard_error_items:
+    if repair_items:
         md_lines.extend(["", "<input>"])
         if use_compact:
             cur_file = None
-            for row in hard_error_items:
+            for row in repair_items:
                 if row["file"] != cur_file:
                     cur_file = row["file"]
                     md_lines.append(f"## @file: {cur_file}")
                 spk = str(row.get("speaker") or "-").replace("|", "\\|")
-                src = str(row.get("post_src", "")).replace("\r\n", "<br>").replace("\n", "<br>").replace("|", "\\|")
-                cur_dst = str(row.get("post_dst", "")).replace("\r\n", "<br>").replace("\n", "<br>").replace("|", "\\|")
+                src = str(row.get("post_src", "")).replace("\r\n", "<br>").replace("\n", "<br>")
+                cur_dst = str(row.get("post_dst", "")).replace("\r\n", "<br>").replace("\n", "<br>")
                 probs = "; ".join(row.get("problems", []))
                 md_lines.append(
-                    f"{row['anchor']}|{row['id']}|{spk}|{src} [CUR_DST: {cur_dst}] [HARD_ERRORS: {probs}]"
+                    f"{row['anchor']}|{row['id']}|{spk}|{src} [CUR_DST: {cur_dst}] [{tag_label}: {probs}]"
                 )
         else:
-            md_lines.extend(["| ANCHOR\\|ID | FILE | SPEAKER | POST_SRC | HARD_ERRORS |", "| --- | --- | --- | --- | --- |"])
-            for row in hard_error_items:
+            md_lines.extend([f"| ANCHOR\\|ID | FILE | SPEAKER | POST_SRC | {tag_label} |", "| --- | --- | --- | --- | --- |"])
+            for row in repair_items:
                 spk = str(row.get("speaker") or "-").replace("|", "\\|")
                 src = str(row.get("post_src", "")).replace("\r\n", "<br>").replace("\n", "<br>").replace("|", "\\|")
                 probs = "; ".join(row.get("problems", [])).replace("|", "\\|")
@@ -720,12 +785,29 @@ def _build_delta_repair_unit(
     return {
         "mode": "delta_repair",
         "blocked": True,
-        "selected_count": len(hard_error_items),
-        "total_matching": len(hard_error_items),
-        "remaining": len(hard_error_items),
+        "selected_count": len(repair_items),
+        "total_matching": len(repair_items),
+        "remaining": len(repair_items),
         "errors": list(parse_or_target_errors),
-        "items": list(hard_error_items),
+        "items": list(repair_items),
         "markdown": "\n".join(md_lines),
+    }
+
+
+def _make_problem_record(it: SentenceItem, h_errs: list[str], s_warns: list[str]) -> dict[str, Any]:
+    return {
+        "file": it.file_name,
+        "id": it.index,
+        "anchor": it.anchor,
+        "patch_key": it.patch_key,
+        "speaker": it.speaker,
+        "post_src": it.post_src,
+        "pre_dst": it.effective_core_dst,
+        "post_dst": it.post_dst,
+        "severity": "error" if h_errs else "warn",
+        "hard_errors": h_errs,
+        "soft_warnings": s_warns,
+        "problems": list(it.problems),
     }
 
 
@@ -747,173 +829,289 @@ def push_batch(
     context_num: int | None = None,
 ) -> dict[str, Any]:
     """Apply patch to `transl_cache` with O(1) selective loading, delta QA lint, history audit, and optional `--pull-next`."""
-    config = ProjectConfig.load(project_dir)
-    profile = config.load_profile_data(project_dir)
-    pre_dict, gpt_dict, post_dict = load_project_dicts(config, project_dir)
-    preserver = TextPreserver.from_project(config, project_dir)
-
     parsed_entries, parse_errors = parse_patch_text(patch_text)
-    if not parsed_entries:
-        loaded = []
-    elif all(bool(e.file_name or default_file) for e in parsed_entries):
-        selective_files = sorted({e.file_name or default_file for e in parsed_entries})
-        loaded = load_project_files(
+    sid = session_id.strip()
+
+    with project_ledger_lock(project_dir):
+        config = ProjectConfig.load(project_dir)
+        profile = config.load_profile_data(project_dir)
+        pre_dict, gpt_dict, post_dict = load_project_dicts(config, project_dir)
+        preserver = TextPreserver.from_project(config, project_dir)
+
+        norm_default_file = default_file.replace("\\", "/") if default_file else ""
+        if not parsed_entries:
+            loaded = []
+        elif all(bool(e.file_name or norm_default_file) for e in parsed_entries):
+            selective_files = sorted(
+                {(e.file_name or norm_default_file).replace("\\", "/") for e in parsed_entries}
+            )
+            loaded = load_project_files(
+                project_dir,
+                config,
+                pre_dict=pre_dict,
+                file_patterns=selective_files,
+                ignore_post_src=True,
+            )
+        else:
+            loaded = load_project_files(project_dir, config, pre_dict=pre_dict, ignore_post_src=True)
+
+        file_map: dict[str, tuple[dict[str, Any], list[SentenceItem]]] = {}
+        by_file_id: dict[tuple[str, int], SentenceItem] = {}
+        by_basename_id: dict[tuple[str, int], list[SentenceItem]] = defaultdict(list)
+        by_anchor_id: dict[tuple[str, int], list[SentenceItem]] = defaultdict(list)
+
+        for rel_name, fmt_meta, items, _hits, _misses in loaded:
+            file_map[rel_name] = (fmt_meta, items)
+            bname = Path(rel_name).name
+            for it in items:
+                by_file_id[(rel_name, it.index)] = it
+                by_basename_id[(bname, it.index)].append(it)
+                by_anchor_id[(it.anchor, it.index)].append(it)
+
+        def _lookup_target(fname_norm: str, idx: int, anchor: str) -> tuple[SentenceItem | None, str]:
+            if fname_norm:
+                cand = by_file_id.get((fname_norm, idx))
+                if cand is not None:
+                    return cand, ""
+                cands = by_basename_id.get((Path(fname_norm).name, idx), [])
+                if len(cands) == 1:
+                    return cands[0], ""
+                return None, ""
+            if anchor:
+                cands = by_anchor_id.get((anchor, idx), [])
+                if len(cands) == 1:
+                    return cands[0], ""
+                if len(cands) > 1:
+                    return None, f"ambiguous anchor|id `{anchor}|{idx}`; specify file name"
+                return None, ""
+            if len(file_map) == 1:
+                only_file = next(iter(file_map.keys()))
+                return by_file_id.get((only_file, idx)), ""
+            return None, ""
+
+        errors: list[str] = list(parse_errors)
+        touched_files: set[str] = set()
+        applied_items: list[SentenceItem] = []
+        history_changes: list[dict[str, Any]] = []
+        config_dirty = False
+
+        for entry in parsed_entries:
+            if entry.index is None:
+                errors.append(f"missing index in entry: {entry.raw_header}")
+                continue
+
+            fname = (entry.file_name or norm_default_file).replace("\\", "/")
+            dst_raw = entry.dst
+            effective_anchor = entry.anchor
+
+            target, lookup_err = _lookup_target(fname, entry.index, effective_anchor)
+            if lookup_err:
+                errors.append(lookup_err)
+                continue
+
+            # Disambiguate 3-digit numeric prefix `123|1|...`: if `(fname, 1)` doesn't exist or
+            # its anchor != "123", fall back to `<id=123>|<dst="1|...">` when item 123 exists!
+            if entry.ambiguous_numeric_anchor and entry.alt_index is not None:
+                if target is None or target.anchor != effective_anchor:
+                    alt_target, _ = _lookup_target(fname, entry.alt_index, "")
+                    if alt_target is not None:
+                        target = alt_target
+                        effective_anchor = ""
+                        dst_raw = entry.alt_dst
+
+            if target is None:
+                errors.append(
+                    f"target item not found: file={fname!r}, id={entry.index}, anchor={entry.anchor!r}"
+                )
+                continue
+
+            if effective_anchor and effective_anchor != target.anchor:
+                errors.append(
+                    f"anchor mismatch for {target.patch_key}: expected `{target.anchor}`, got `{effective_anchor}`"
+                )
+                continue
+
+            dst_val = dst_raw
+            if dst_val == "" and target.post_src.strip() != "":
+                errors.append(f"empty translation submitted for non-empty item {target.patch_key}")
+                continue
+
+            before_snap = snapshot_item_fields(target)
+
+            if "<br>" in dst_val and "<br>" not in target.pre_src.lower():
+                if "\r\n" in target.post_src:
+                    dst_val = dst_val.replace("<br>", "\r\n")
+                elif "\n" in target.post_src:
+                    dst_val = dst_val.replace("<br>", "\n")
+                elif "\\r\\n" in target.post_src and "\\r\\n" not in dst_val:
+                    dst_val = dst_val.replace("<br>", "\\r\\n")
+                elif "\\n" in target.post_src and "\\n" not in dst_val:
+                    dst_val = dst_val.replace("<br>", "\\n")
+
+            if proofread:
+                target.proofread_dst = dst_val
+                target.proofread_by = trans_by
+                target.status = ItemStatus.PROOFREAD.value
+            else:
+                target.pre_dst = dst_val
+                target.proofread_dst = ""
+                target.trans_by = trans_by
+                target.status = ItemStatus.PROCESSED.value
+
+            if entry.comment:
+                target.proofread_comment = entry.comment
+
+            if entry.speaker_dst:
+                target.speaker_dst = entry.speaker_dst
+                if target.speaker and config.speaker_map.get(target.speaker) != entry.speaker_dst:
+                    config.speaker_map[target.speaker] = entry.speaker_dst
+                    config_dirty = True
+            elif target.speaker and not target.speaker_dst and target.speaker in config.speaker_map:
+                target.speaker_dst = config.speaker_map[target.speaker]
+
+            normalize_and_restore_dst(target, config, post_dict=post_dict, preserver=preserver)
+            check_item_problems(target, config, profile=profile, preserver=preserver, gpt_dict=gpt_dict)
+
+            history_changes.append(
+                {
+                    "file": target.file_name,
+                    "index": target.index,
+                    "before": before_snap,
+                    "after": snapshot_item_fields(target),
+                }
+            )
+            touched_files.add(target.file_name)
+            applied_items.append(target)
+
+        export_payload: list[tuple[str, dict[str, Any], list[SentenceItem]]] = []
+        for rel_name in sorted(touched_files):
+            fmt_meta, items = file_map[rel_name]
+            save_cache_file(project_dir, config, rel_name, items)
+            export_payload.append((rel_name, fmt_meta, items))
+
+        if config_dirty:
+            config.save(project_dir)
+
+        task_id = append_history_event(
             project_dir,
             config,
-            pre_dict=pre_dict,
-            file_patterns=selective_files,
-            ignore_post_src=True,
+            action="batch-push",
+            reason=reason,
+            changes=history_changes,
         )
-    else:
-        loaded = load_project_files(project_dir, config, pre_dict=pre_dict, ignore_post_src=True)
 
-    file_map: dict[str, tuple[dict[str, Any], list[SentenceItem]]] = {}
-    by_file_id: dict[tuple[str, int], SentenceItem] = {}
-    by_basename_id: dict[tuple[str, int], list[SentenceItem]] = defaultdict(list)
-    by_anchor_id: dict[tuple[str, int], list[SentenceItem]] = defaultdict(list)
+        is_gbk_target = config.target_encoding.lower() in ("gbk", "gb2312", "cp936")
+        if refresh_output and export_payload:
+            for rel_name, fmt_meta, items in export_payload:
+                if is_gbk_target and any(
+                    any(p.startswith("非GBK字符") for p in it.problems) for it in items
+                ):
+                    # Defer GBK export until 非GBK字符 hard errors are fixed so lint/repair report returns cleanly
+                    continue
+                try:
+                    export_project_outputs(project_dir, config, [(rel_name, fmt_meta, items)])
+                except UnicodeEncodeError as exc:
+                    errors.append(f"encoding error exporting {rel_name} as {config.target_encoding}: {exc}")
 
-    for rel_name, fmt_meta, items, _hits, _misses in loaded:
-        file_map[rel_name] = (fmt_meta, items)
-        bname = Path(rel_name).name
-        for it in items:
-            by_file_id[(rel_name, it.index)] = it
-            by_basename_id[(bname, it.index)].append(it)
-            by_anchor_id[(it.anchor, it.index)].append(it)
+        problem_items: list[dict[str, Any]] = []
+        hard_error_items: list[dict[str, Any]] = []
+        soft_warn_items: list[dict[str, Any]] = []
 
-    errors: list[str] = list(parse_errors)
-    touched_files: set[str] = set()
-    applied_items: list[SentenceItem] = []
-    history_changes: list[dict[str, Any]] = []
-    config_dirty = False
-
-    for entry in parsed_entries:
-        if entry.index is None:
-            errors.append(f"missing index in entry: {entry.raw_header}")
-            continue
-
-        target: SentenceItem | None = None
-        fname = entry.file_name or default_file
-
-        if fname:
-            target = by_file_id.get((fname, entry.index))
-            if target is None:
-                cands = by_basename_id.get((Path(fname).name, entry.index), [])
-                if len(cands) == 1:
-                    target = cands[0]
-        elif entry.anchor:
-            cands = by_anchor_id.get((entry.anchor, entry.index), [])
-            if len(cands) == 1:
-                target = cands[0]
-            elif len(cands) > 1:
-                errors.append(f"ambiguous anchor|id `{entry.anchor}|{entry.index}`; specify file name")
+        for it in applied_items:
+            if not it.problems:
                 continue
-        elif len(file_map) == 1:
-            only_file = next(iter(file_map.keys()))
-            target = by_file_id.get((only_file, entry.index))
+            h_errs, s_warns = split_problems_by_severity(it.problems)
+            base_rec = _make_problem_record(it, h_errs, s_warns)
+            problem_items.append(base_rec)
+            if h_errs:
+                hard_error_items.append({**base_rec, "problems": h_errs})
+            if s_warns:
+                soft_warn_items.append({**base_rec, "problems": s_warns})
 
-        if target is None:
-            errors.append(
-                f"target item not found: file={fname!r}, id={entry.index}, anchor={entry.anchor!r}"
+        # Circuit-breaker anti-bypass: collect ANY remaining hard errors in touched_files or pending session repair set
+        blocking_hard_items: list[dict[str, Any]] = list(hard_error_items)
+        seen_hard_keys = {(r["file"], r["id"]) for r in blocking_hard_items}
+        sess_state: dict[str, Any] = _load_session_state(project_dir, sid) if sid else {}
+        if pull_next:
+            for rel_name in sorted(touched_files):
+                _, items = file_map[rel_name]
+                for it in items:
+                    if not it.problems or (it.file_name, it.index) in seen_hard_keys:
+                        continue
+                    h_errs, s_warns = split_problems_by_severity(it.problems)
+                    if h_errs:
+                        seen_hard_keys.add((it.file_name, it.index))
+                        blocking_hard_items.append(
+                            {**_make_problem_record(it, h_errs, s_warns), "problems": h_errs}
+                        )
+            pending_hard_refs: list[str] = list(sess_state.get("pending_hard_errors", []))
+            missing_pending_files = sorted(
+                {
+                    ref.rsplit(":", 1)[0]
+                    for ref in pending_hard_refs
+                    if ":" in ref and ref.rsplit(":", 1)[0] not in file_map
+                }
             )
-            continue
+            if missing_pending_files:
+                extra_loaded = load_project_files(
+                    project_dir,
+                    config,
+                    pre_dict=pre_dict,
+                    file_patterns=missing_pending_files,
+                    ignore_post_src=True,
+                )
+                for rel_name, fmt_meta, items, _h, _m in extra_loaded:
+                    file_map[rel_name] = (fmt_meta, items)
+                    for it in items:
+                        by_file_id[(rel_name, it.index)] = it
+            for ref in pending_hard_refs:
+                if ":" not in ref:
+                    continue
+                pf, pid_s = ref.rsplit(":", 1)
+                try:
+                    pid = int(pid_s)
+                except ValueError:
+                    continue
+                pit = by_file_id.get((pf, pid))
+                if pit is None or not pit.problems or (pit.file_name, pit.index) in seen_hard_keys:
+                    continue
+                h_errs, s_warns = split_problems_by_severity(pit.problems)
+                if h_errs:
+                    seen_hard_keys.add((pit.file_name, pit.index))
+                    blocking_hard_items.append(
+                        {**_make_problem_record(pit, h_errs, s_warns), "problems": h_errs}
+                    )
 
-        if entry.anchor and entry.anchor != target.anchor:
-            errors.append(
-                f"anchor mismatch for {target.patch_key}: expected `{target.anchor}`, got `{entry.anchor}`"
-            )
-            continue
+        batch_warn_cap = config.compute_batch_warn_budget(len(applied_items))
 
-        before_snap = snapshot_item_fields(target)
-
-        dst_val = entry.dst
-        if "<br>" in dst_val and "<br>" not in target.pre_src:
-            if "\r\n" in target.post_src:
-                dst_val = dst_val.replace("<br>", "\r\n")
-            elif "\n" in target.post_src:
-                dst_val = dst_val.replace("<br>", "\n")
-
-        if proofread:
-            target.proofread_dst = dst_val
-            target.proofread_by = trans_by
-            target.status = ItemStatus.PROOFREAD.value
-        else:
-            target.pre_dst = dst_val
-            target.proofread_dst = ""
-            target.trans_by = trans_by
-            target.status = ItemStatus.PROCESSED.value
-
-        if entry.comment:
-            target.proofread_comment = entry.comment
-
-        if entry.speaker_dst:
-            target.speaker_dst = entry.speaker_dst
-            if target.speaker and config.speaker_map.get(target.speaker) != entry.speaker_dst:
-                config.speaker_map[target.speaker] = entry.speaker_dst
-                config_dirty = True
-        elif target.speaker and not target.speaker_dst and target.speaker in config.speaker_map:
-            target.speaker_dst = config.speaker_map[target.speaker]
-
-        normalize_and_restore_dst(target, config, post_dict=post_dict, preserver=preserver)
-        check_item_problems(target, config, profile=profile, preserver=preserver, gpt_dict=gpt_dict)
-
-        history_changes.append(
-            {
-                "file": target.file_name,
-                "index": target.index,
-                "before": before_snap,
-                "after": snapshot_item_fields(target),
-            }
-        )
-        touched_files.add(target.file_name)
-        applied_items.append(target)
-
-    export_payload: list[tuple[str, dict[str, Any], list[SentenceItem]]] = []
-    for rel_name in sorted(touched_files):
-        fmt_meta, items = file_map[rel_name]
-        save_cache_file(project_dir, config, rel_name, items)
-        export_payload.append((rel_name, fmt_meta, items))
-
-    if config_dirty:
-        config.save(project_dir)
-
-    task_id = append_history_event(
-        project_dir,
-        config,
-        action="batch-push",
-        reason=reason,
-        changes=history_changes,
-    )
-
-    if refresh_output and export_payload:
-        export_project_outputs(project_dir, config, export_payload)
-
-    problem_items: list[dict[str, Any]] = []
-    hard_error_items: list[dict[str, Any]] = []
-    soft_warn_items: list[dict[str, Any]] = []
-
-    for it in applied_items:
-        if not it.problems:
-            continue
-        h_errs, s_warns = split_problems_by_severity(it.problems)
-        base_rec = {
-            "file": it.file_name,
-            "id": it.index,
-            "anchor": it.anchor,
-            "patch_key": it.patch_key,
-            "speaker": it.speaker,
-            "post_src": it.post_src,
-            "pre_dst": it.effective_core_dst,
-            "post_dst": it.post_dst,
-            "severity": "error" if h_errs else "warn",
-            "hard_errors": h_errs,
-            "soft_warnings": s_warns,
-            "problems": list(it.problems),
-        }
-        problem_items.append(base_rec)
-        if h_errs:
-            hard_error_items.append({**base_rec, "problems": h_errs})
-        if s_warns:
-            soft_warn_items.append({**base_rec, "problems": s_warns})
+        # Check persisted warn-spike debt across session if present
+        blocking_warn_items: list[dict[str, Any]] = []
+        blocking_warn_cap = batch_warn_cap
+        if pull_next:
+            if applied_items and len(soft_warn_items) > batch_warn_cap:
+                blocking_warn_items = list(soft_warn_items)
+            elif sid and isinstance(sess_state.get("pending_warn_spike"), dict):
+                pws = sess_state["pending_warn_spike"]
+                p_keys = list(pws.get("keys", []))
+                p_cap = int(pws.get("cap", batch_warn_cap))
+                rem_warns: list[dict[str, Any]] = []
+                for ref in p_keys:
+                    if ":" not in ref:
+                        continue
+                    pf, pid_s = ref.rsplit(":", 1)
+                    try:
+                        pid = int(pid_s)
+                    except ValueError:
+                        continue
+                    pit = by_file_id.get((pf, pid))
+                    if pit is None or not pit.problems:
+                        continue
+                    h_errs, s_warns = split_problems_by_severity(pit.problems)
+                    if s_warns:
+                        rem_warns.append({**_make_problem_record(pit, h_errs, s_warns), "problems": s_warns})
+                if len(rem_warns) > p_cap:
+                    blocking_warn_items = rem_warns
+                    blocking_warn_cap = p_cap
 
     result: dict[str, Any] = {
         "task_id": task_id,
@@ -928,34 +1126,52 @@ def push_batch(
         "problem_items": problem_items,
         "hard_error_items": hard_error_items,
         "soft_warn_items": soft_warn_items,
+        "batch_warn_budget": batch_warn_cap,
     }
 
-    batch_warn_cap = config.compute_batch_warn_budget(len(applied_items))
-    result["batch_warn_budget"] = batch_warn_cap
-
     if pull_next:
-        use_compact = False if no_compact else (compact or bool(session_id.strip()))
-        if hard_error_items or errors:
+        use_compact = False if no_compact else (compact or bool(sid))
+        if blocking_hard_items or errors:
+            if sid:
+                sess_state["session_id"] = sid
+                sess_state["pending_hard_errors"] = [
+                    f"{r['file']}:{r['id']}" for r in blocking_hard_items
+                ]
+                _save_session_state(project_dir, sid, sess_state)
             result["pull_next_status"] = "blocked_by_errors"
             result["next_batch"] = _build_delta_repair_unit(
-                hard_error_items,
+                blocking_hard_items,
                 errors,
                 use_compact=use_compact,
+                is_warn_spike=False,
             )
-        elif applied_items and len(soft_warn_items) > batch_warn_cap:
+        elif blocking_warn_items:
+            if sid:
+                sess_state["session_id"] = sid
+                sess_state["pending_hard_errors"] = []
+                sess_state["pending_warn_spike"] = {
+                    "keys": [f"{r['file']}:{r['id']}" for r in blocking_warn_items],
+                    "cap": blocking_warn_cap,
+                }
+                _save_session_state(project_dir, sid, sess_state)
             result["pull_next_status"] = "blocked_by_warn_spike"
             result["next_batch"] = _build_delta_repair_unit(
-                soft_warn_items,
+                blocking_warn_items,
                 [
-                    f"per-batch soft warnings ({len(soft_warn_items)}) exceed batch warn cap ({batch_warn_cap}); trim overly long/drifted lines before advancing"
+                    f"per-batch soft warnings ({len(blocking_warn_items)}) exceed batch warn cap ({blocking_warn_cap}); trim overly long/drifted lines before advancing"
                 ],
                 use_compact=use_compact,
+                is_warn_spike=True,
             )
         else:
+            if sid and (sess_state.get("pending_hard_errors") or sess_state.get("pending_warn_spike")):
+                sess_state["pending_hard_errors"] = []
+                sess_state.pop("pending_warn_spike", None)
+                _save_session_state(project_dir, sid, sess_state)
             result["pull_next_status"] = "advanced"
             result["next_batch"] = pull_batch(
                 project_dir,
-                file_patterns=file_patterns or ([default_file] if default_file else None),
+                file_patterns=file_patterns or ([norm_default_file] if norm_default_file else None),
                 batch_size=batch_size,
                 context_num=context_num,
                 only_miss=True,
@@ -976,89 +1192,118 @@ def edit_cache_entries(
     refresh_output: bool = True,
 ) -> dict[str, Any]:
     """Batch-patch specific `(file, index)` entries in `transl_cache` with O(1) delta file loading & history audit."""
-    config = ProjectConfig.load(project_dir)
-    profile = config.load_profile_data(project_dir)
-    pre_dict, gpt_dict, post_dict = load_project_dicts(config, project_dir)
-    preserver = TextPreserver.from_project(config, project_dir)
+    with project_ledger_lock(project_dir):
+        config = ProjectConfig.load(project_dir)
+        profile = config.load_profile_data(project_dir)
+        pre_dict, gpt_dict, post_dict = load_project_dicts(config, project_dir)
+        preserver = TextPreserver.from_project(config, project_dir)
 
-    if not edits:
-        loaded = []
-    elif all(bool(str(ed.get("file", "")).strip()) for ed in edits):
-        edit_files = sorted({str(ed.get("file", "")).strip() for ed in edits})
-        loaded = load_project_files(
+        if not edits:
+            loaded = []
+        elif all(bool(str(ed.get("file", "")).strip()) for ed in edits):
+            edit_files = sorted(
+                {str(ed.get("file", "")).strip().replace("\\", "/") for ed in edits}
+            )
+            loaded = load_project_files(
+                project_dir,
+                config,
+                pre_dict=pre_dict,
+                file_patterns=edit_files,
+                ignore_post_src=True,
+            )
+        else:
+            loaded = load_project_files(project_dir, config, pre_dict=pre_dict, ignore_post_src=True)
+
+        file_map = {rel: (meta, items) for rel, meta, items, _h, _m in loaded}
+        by_file_id = {(rel, it.index): it for rel, _meta, items, _h, _m in loaded for it in items}
+        by_basename_id: dict[tuple[str, int], list[SentenceItem]] = defaultdict(list)
+        for rel, _meta, items, _h, _m in loaded:
+            bname = Path(rel).name
+            for it in items:
+                by_basename_id[(bname, it.index)].append(it)
+
+        touched: set[str] = set()
+        changes: list[dict[str, Any]] = []
+        errors: list[str] = []
+        updated_items: list[SentenceItem] = []
+
+        for ed in edits:
+            fname = str(ed.get("file", "")).strip().replace("\\", "/")
+            idx = int(ed.get("index", 0))
+            target = by_file_id.get((fname, idx))
+            if target is None and fname:
+                cands = by_basename_id.get((Path(fname).name, idx), [])
+                if len(cands) == 1:
+                    target = cands[0]
+            if target is None:
+                errors.append(f"item not found: {fname}|{idx}")
+                continue
+            before_snap = snapshot_item_fields(target)
+            if ed.get("pre_dst") is not None:
+                target.pre_dst = str(ed["pre_dst"])
+            if ed.get("proofread_dst") is not None:
+                target.proofread_dst = str(ed["proofread_dst"])
+                if target.proofread_dst:
+                    target.proofread_by = str(ed.get("by", "editor"))
+                else:
+                    target.proofread_by = ""
+            if ed.get("speaker_dst") is not None:
+                target.speaker_dst = str(ed["speaker_dst"])
+            if ed.get("skip_check") is not None:
+                target.skip_check = bool(ed["skip_check"])
+            if ed.get("proofread_comment") is not None:
+                target.proofread_comment = str(ed["proofread_comment"])
+
+            # Deterministically reconcile status with actual active translation fields
+            if target.proofread_dst != "":
+                target.status = ItemStatus.PROOFREAD.value
+            elif target.pre_dst != "":
+                target.status = ItemStatus.PROCESSED.value
+            else:
+                target.status = ItemStatus.NONE.value
+
+            if target.effective_core_dst != "":
+                normalize_and_restore_dst(target, config, post_dict=post_dict, preserver=preserver)
+                check_item_problems(target, config, profile=profile, preserver=preserver, gpt_dict=gpt_dict)
+            else:
+                target.post_dst = ""
+                target.problems = []
+
+            changes.append(
+                {
+                    "file": target.file_name,
+                    "index": target.index,
+                    "before": before_snap,
+                    "after": snapshot_item_fields(target),
+                }
+            )
+            touched.add(target.file_name)
+            updated_items.append(target)
+
+        export_payload = []
+        for rel_name in sorted(touched):
+            fmt_meta, items = file_map[rel_name]
+            save_cache_file(project_dir, config, rel_name, items)
+            export_payload.append((rel_name, fmt_meta, items))
+
+        task_id = append_history_event(
             project_dir,
             config,
-            pre_dict=pre_dict,
-            file_patterns=edit_files,
-            ignore_post_src=True,
+            action="edit-cache",
+            reason=reason,
+            changes=changes,
         )
-    else:
-        loaded = load_project_files(project_dir, config, pre_dict=pre_dict, ignore_post_src=True)
-
-    file_map = {rel: (meta, items) for rel, meta, items, _h, _m in loaded}
-    by_file_id = {(rel, it.index): it for rel, _meta, items, _h, _m in loaded for it in items}
-
-    touched: set[str] = set()
-    changes: list[dict[str, Any]] = []
-    errors: list[str] = []
-    updated_items: list[SentenceItem] = []
-
-    for ed in edits:
-        fname = str(ed.get("file", ""))
-        idx = int(ed.get("index", 0))
-        target = by_file_id.get((fname, idx))
-        if target is None:
-            errors.append(f"item not found: {fname}|{idx}")
-            continue
-        before_snap = snapshot_item_fields(target)
-        if ed.get("pre_dst") is not None:
-            target.pre_dst = str(ed["pre_dst"])
-            target.status = ItemStatus.PROCESSED.value
-        if ed.get("proofread_dst") is not None:
-            target.proofread_dst = str(ed["proofread_dst"])
-            if target.proofread_dst:
-                target.status = ItemStatus.PROOFREAD.value
-                target.proofread_by = str(ed.get("by", "editor"))
-        if ed.get("speaker_dst") is not None:
-            target.speaker_dst = str(ed["speaker_dst"])
-        if ed.get("skip_check") is not None:
-            target.skip_check = bool(ed["skip_check"])
-        if ed.get("proofread_comment") is not None:
-            target.proofread_comment = str(ed["proofread_comment"])
-
-        if target.effective_core_dst != "":
-            normalize_and_restore_dst(target, config, post_dict=post_dict, preserver=preserver)
-            check_item_problems(target, config, profile=profile, preserver=preserver, gpt_dict=gpt_dict)
-        else:
-            target.post_dst = ""
-            target.problems = []
-
-        changes.append(
-            {
-                "file": target.file_name,
-                "index": target.index,
-                "before": before_snap,
-                "after": snapshot_item_fields(target),
-            }
-        )
-        touched.add(target.file_name)
-        updated_items.append(target)
-
-    export_payload = []
-    for rel_name in sorted(touched):
-        fmt_meta, items = file_map[rel_name]
-        save_cache_file(project_dir, config, rel_name, items)
-        export_payload.append((rel_name, fmt_meta, items))
-
-    task_id = append_history_event(
-        project_dir,
-        config,
-        action="edit-cache",
-        reason=reason,
-        changes=changes,
-    )
-    if refresh_output and export_payload:
-        export_project_outputs(project_dir, config, export_payload)
+        is_gbk_target = config.target_encoding.lower() in ("gbk", "gb2312", "cp936")
+        if refresh_output and export_payload:
+            for rel_name, fmt_meta, items in export_payload:
+                if is_gbk_target and any(
+                    any(p.startswith("非GBK字符") for p in it.problems) for it in items
+                ):
+                    continue
+                try:
+                    export_project_outputs(project_dir, config, [(rel_name, fmt_meta, items)])
+                except UnicodeEncodeError as exc:
+                    errors.append(f"encoding error exporting {rel_name} as {config.target_encoding}: {exc}")
 
     return {
         "task_id": task_id,
@@ -1185,88 +1430,101 @@ def search_replace_project(
     refresh_output: bool = True,
 ) -> dict[str, Any]:
     """Search and replace across `transl_cache`, recording history for one-click `revert`."""
-    config = ProjectConfig.load(project_dir)
-    profile = config.load_profile_data(project_dir)
-    pre_dict, gpt_dict, post_dict = load_project_dicts(config, project_dir)
-    preserver = TextPreserver.from_project(config, project_dir)
-
     rx = re.compile(find) if use_regex else None
-    loaded = load_project_files(
-        project_dir,
-        config,
-        pre_dict=pre_dict,
-        file_patterns=file_patterns,
-        ignore_post_src=True,
-    )
 
-    changes_preview: list[dict[str, Any]] = []
-    history_changes: list[dict[str, Any]] = []
-    touched_files: list[str] = []
-    export_payload: list[tuple[str, dict[str, Any], list[SentenceItem]]] = []
+    with project_ledger_lock(project_dir):
+        config = ProjectConfig.load(project_dir)
+        profile = config.load_profile_data(project_dir)
+        pre_dict, gpt_dict, post_dict = load_project_dicts(config, project_dir)
+        preserver = TextPreserver.from_project(config, project_dir)
 
-    for rel_name, fmt_meta, items, _hits, _misses in loaded:
-        file_dirty = False
-        for it in items:
-            if only_problem and not any(only_problem in p for p in it.problems):
-                continue
-            if field == "speaker_dst":
-                old_val = it.speaker_dst
-            elif field == "proofread_dst":
-                old_val = it.proofread_dst
-            else:
-                old_val = it.effective_core_dst
-            if not old_val:
-                continue
-
-            new_val = rx.sub(replace, old_val) if (use_regex and rx is not None) else old_val.replace(find, replace)
-            if new_val == old_val:
-                continue
-
-            changes_preview.append(
-                {
-                    "file": rel_name,
-                    "id": it.index,
-                    "field": field,
-                    "before": old_val,
-                    "after": new_val,
-                }
-            )
-            if not dry_run:
-                before_snap = snapshot_item_fields(it)
-                if field == "speaker_dst":
-                    it.speaker_dst = new_val
-                elif field == "proofread_dst" or it.proofread_dst:
-                    it.proofread_dst = new_val
-                else:
-                    it.pre_dst = new_val
-                normalize_and_restore_dst(it, config, post_dict=post_dict, preserver=preserver)
-                check_item_problems(it, config, profile=profile, preserver=preserver, gpt_dict=gpt_dict)
-                history_changes.append(
-                    {
-                        "file": rel_name,
-                        "index": it.index,
-                        "before": before_snap,
-                        "after": snapshot_item_fields(it),
-                    }
-                )
-                file_dirty = True
-
-        if file_dirty and not dry_run:
-            save_cache_file(project_dir, config, rel_name, items)
-            touched_files.append(rel_name)
-            export_payload.append((rel_name, fmt_meta, items))
-
-    task_id = ""
-    if not dry_run and history_changes:
-        task_id = append_history_event(
+        loaded = load_project_files(
             project_dir,
             config,
-            action="search-replace",
-            reason=reason,
-            changes=history_changes,
+            pre_dict=pre_dict,
+            file_patterns=file_patterns,
+            ignore_post_src=True,
         )
-        if refresh_output and export_payload:
-            export_project_outputs(project_dir, config, export_payload)
+
+        changes_preview: list[dict[str, Any]] = []
+        history_changes: list[dict[str, Any]] = []
+        touched_files: list[str] = []
+        export_payload: list[tuple[str, dict[str, Any], list[SentenceItem]]] = []
+
+        for rel_name, fmt_meta, items, _hits, _misses in loaded:
+            file_dirty = False
+            for it in items:
+                if only_problem and not any(only_problem in p for p in it.problems):
+                    continue
+                if field == "speaker_dst":
+                    old_val = it.speaker_dst
+                elif field == "proofread_dst":
+                    old_val = it.proofread_dst
+                elif field == "effective":
+                    old_val = it.effective_core_dst
+                else:
+                    old_val = it.pre_dst
+                if not old_val:
+                    continue
+
+                new_val = rx.sub(replace, old_val) if (use_regex and rx is not None) else old_val.replace(find, replace)
+                if new_val == old_val:
+                    continue
+
+                changes_preview.append(
+                    {
+                        "file": rel_name,
+                        "id": it.index,
+                        "field": field,
+                        "before": old_val,
+                        "after": new_val,
+                    }
+                )
+                if not dry_run:
+                    before_snap = snapshot_item_fields(it)
+                    if field == "speaker_dst":
+                        it.speaker_dst = new_val
+                    elif field == "proofread_dst":
+                        it.proofread_dst = new_val
+                    elif field == "effective":
+                        if it.proofread_dst:
+                            it.proofread_dst = new_val
+                        else:
+                            it.pre_dst = new_val
+                    else:
+                        it.pre_dst = new_val
+                    normalize_and_restore_dst(it, config, post_dict=post_dict, preserver=preserver)
+                    check_item_problems(it, config, profile=profile, preserver=preserver, gpt_dict=gpt_dict)
+                    history_changes.append(
+                        {
+                            "file": rel_name,
+                            "index": it.index,
+                            "before": before_snap,
+                            "after": snapshot_item_fields(it),
+                        }
+                    )
+                    file_dirty = True
+
+            if file_dirty and not dry_run:
+                save_cache_file(project_dir, config, rel_name, items)
+                touched_files.append(rel_name)
+                export_payload.append((rel_name, fmt_meta, items))
+
+        task_id = ""
+        if not dry_run and history_changes:
+            task_id = append_history_event(
+                project_dir,
+                config,
+                action="search-replace",
+                reason=reason,
+                changes=history_changes,
+            )
+            if refresh_output and export_payload:
+                for rel_name, fmt_meta, items in export_payload:
+                    try:
+                        export_project_outputs(project_dir, config, [(rel_name, fmt_meta, items)])
+                    except UnicodeEncodeError:
+                        pass
 
     return {
         "dry_run": dry_run,

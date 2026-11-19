@@ -124,6 +124,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         strip_outer_quotes=not args.no_strip_quotes,
         align_trailing_period=not args.no_align_period,
     )
+    if getattr(args, "enable_h_dict", False) and "builtin:pre_h_phonetic.tsv" not in cfg.pre_dicts:
+        cfg.pre_dicts.insert(0, "builtin:pre_h_phonetic.tsv")
 
     profile_data = cfg.load_profile_data(project_dir)
     if not cfg.guideline:
@@ -167,7 +169,11 @@ def cmd_import(args: argparse.Namespace) -> int:
     config = ProjectConfig.load(project_dir)
     pre_dict, _, _ = load_project_dicts(config, project_dir)
 
-    imported = import_path(args.format, Path(args.input).resolve())
+    imported = import_path(
+        args.format,
+        Path(args.input).resolve(),
+        pipe_style=getattr(args, "pipe_style", "auto"),
+    )
     total_items = 0
     dialogue_items = 0
     stripped_quotes = 0
@@ -842,6 +848,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     total_items = 0
     translated_items = 0
     problem_items = 0
+    hard_error_items = 0
     export_payload = []
 
     for rel_name, fmt_meta, items, _hits, _misses in loaded:
@@ -851,6 +858,8 @@ def cmd_export(args: argparse.Namespace) -> int:
                 translated_items += 1
             if it.problems:
                 problem_items += 1
+                if split_problems_by_severity(it.problems)[0]:
+                    hard_error_items += 1
         export_payload.append((rel_name, fmt_meta, items))
 
     untranslated = total_items - translated_items
@@ -861,19 +870,45 @@ def cmd_export(args: argparse.Namespace) -> int:
             "total_items": total_items,
             "translated_items": translated_items,
             "problem_items": problem_items,
+            "hard_error_items": hard_error_items,
         }
         _emit(payload, args.out_format, f"# Export Blocked\n\n- {payload['reason']}")
         return 1
 
-    exported_files = export_project_outputs(
-        project_dir,
-        config,
-        export_payload,
-        output_dir=out_dir,
-        output_format=out_fmt,
-        encoding=encoding,
-        with_src=args.with_src,
-    )
+    if hard_error_items > 0 and not getattr(args, "allow_errors", False):
+        payload = {
+            "status": "blocked",
+            "reason": f"{hard_error_items} item(s) still have hard QA errors; fix them or pass --allow-errors to export anyway",
+            "total_items": total_items,
+            "translated_items": translated_items,
+            "problem_items": problem_items,
+            "hard_error_items": hard_error_items,
+        }
+        _emit(payload, args.out_format, f"# Export Blocked\n\n- {payload['reason']}")
+        return 1
+
+    try:
+        exported_files = export_project_outputs(
+            project_dir,
+            config,
+            export_payload,
+            output_dir=out_dir,
+            output_format=out_fmt,
+            encoding=encoding,
+            with_src=args.with_src,
+        )
+    except UnicodeEncodeError as exc:
+        payload = {
+            "status": "encoding_error",
+            "reason": f"Failed to encode exported files as {encoding}: {exc}",
+            "encoding": encoding,
+            "total_items": total_items,
+            "translated_items": translated_items,
+            "problem_items": problem_items,
+            "hard_error_items": hard_error_items,
+        }
+        _emit(payload, args.out_format, f"# Export Failed (`{encoding}`)\n\n- {payload['reason']}")
+        return 1
 
     payload = {
         "status": "exported",
@@ -971,6 +1006,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--ruby-mode", default="translate", choices=["translate", "verbatim", "flexible"])
     p_init.add_argument("--no-strip-quotes", action="store_true")
     p_init.add_argument("--no-align-period", action="store_true")
+    p_init.add_argument("--enable-h-dict", action="store_true", help="Opt-in builtin:pre_h_phonetic.tsv")
     p_init.add_argument("--out-format", default="markdown", choices=["markdown", "json"])
     p_init.set_defaults(func=cmd_init)
 
@@ -979,6 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_imp.add_argument("--project", required=True)
     p_imp.add_argument("--format", required=True, choices=["gt_json", "compact_pipe"])
     p_imp.add_argument("--input", required=True)
+    p_imp.add_argument("--pipe-style", default="auto", choices=["auto", "pipe", "bracket", "plain"])
     p_imp.add_argument("--out-format", default="markdown", choices=["markdown", "json"])
     p_imp.set_defaults(func=cmd_import)
 
@@ -1103,7 +1140,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_sr.add_argument("--project", required=True)
     p_sr.add_argument("--find", required=True)
     p_sr.add_argument("--replace", required=True)
-    p_sr.add_argument("--field", default="pre_dst", choices=["pre_dst", "proofread_dst", "speaker_dst"])
+    p_sr.add_argument(
+        "--field",
+        default="pre_dst",
+        choices=["pre_dst", "proofread_dst", "effective", "speaker_dst"],
+    )
     p_sr.add_argument("--regex", action="store_true")
     p_sr.add_argument("--files", action="append", default=[])
     p_sr.add_argument("--only-problem", default=None)
@@ -1161,6 +1202,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--files", action="append", default=[])
     p_exp.add_argument("--with-src", action="store_true")
     p_exp.add_argument("--allow-incomplete", action="store_true")
+    p_exp.add_argument("--allow-errors", action="store_true")
     p_exp.add_argument("--out-format", default="markdown", choices=["markdown", "json"])
     p_exp.set_defaults(func=cmd_export)
 

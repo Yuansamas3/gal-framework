@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from typing import Sequence
 
 from .dictionary import NormalDict
 from .models import ProjectConfig, SentenceItem
-from .text_preserve import TextPreserver
+from .text_preserve import PLACEHOLDER_RE, TextPreserver
+
+_TRAILING_PLACEHOLDERS_RE = re.compile(r"(?:\ue000[\ue010-\ue01f]+\ue001)+$")
 
 _QUOTE_PAIRS: dict[str, str] = {
     "「": "」",
@@ -302,35 +305,55 @@ def _remove_first_symbol(dst: str, post_src: str) -> str:
     return out
 
 
-def _fix_last_symbol(dst: str, post_src: str, *, align_trailing_period: bool = True) -> str:
-    """Deterministically align trailing punctuation against post_src."""
+def _fix_last_symbol(
+    dst: str,
+    post_src: str,
+    *,
+    align_trailing_period: bool = True,
+    protected_post_src: str | None = None,
+) -> str:
+    """Deterministically align trailing punctuation against post_src (even before trailing control codes)."""
     if not dst:
         return dst
+
+    # Temporarily detach trailing control placeholders so e.g. `早上好。[l]` aligns cleanly against `おはよう[l]`
+    tail = ""
     out = dst
+    m_dst = _TRAILING_PLACEHOLDERS_RE.search(out)
+    if m_dst:
+        tail = m_dst.group(0)
+        out = out[: m_dst.start()]
+        if not out:
+            return dst
+
+    src_ref = protected_post_src if protected_post_src is not None else post_src
+    m_src = _TRAILING_PLACEHOLDERS_RE.search(src_ref)
+    if m_src:
+        src_ref = src_ref[: m_src.start()]
 
     for nl in ("\r\n", "\n", "\\r\\n", "\\n"):
-        if out.endswith(nl) and not post_src.endswith(nl):
+        if out.endswith(nl) and not src_ref.endswith(nl):
             out = out[: -len(nl)]
 
-    if post_src[-1:] not in ("、", "，") and out.endswith("，"):
+    if src_ref[-1:] not in ("、", "，") and out.endswith("，"):
         out = out[:-1]
 
-    if align_trailing_period and out.endswith("。") and post_src[-1:] not in (".", "。"):
+    if align_trailing_period and out.endswith("。") and src_ref[-1:] not in (".", "。"):
         out = out[:-1]
 
-    if post_src.endswith("♪"):
-        if out.endswith("。♪") and not post_src.endswith("。♪"):
+    if src_ref.endswith("♪"):
+        if out.endswith("。♪") and not src_ref.endswith("。♪"):
             out = out[:-2] + "♪"
         elif not out.endswith("♪"):
             out += "♪"
 
-    if post_src.endswith("！？"):
+    if src_ref.endswith("！？"):
         if out.endswith("！"):
             out += "？"
         elif out.endswith("!"):
             out = out[:-1] + "！？"
 
-    return out
+    return out + tail
 
 
 def _fix_inner_punctuation_and_quotes(dst: str, post_src: str) -> str:
@@ -397,11 +420,18 @@ def normalize_and_restore_dst(
 
     # Single unbroken shield over control tokens AND ruby tags across post_dict + punctuation pipeline
     token_map: dict[str, str] = {}
+    protected_post_src: str | None = None
     if preserver is not None:
         dst, token_map = preserver.protect_text(dst, include_ruby=True)
+        protected_post_src, _ = preserver.protect_text(post_src, include_ruby=True)
 
     dst = _remove_first_symbol(dst, post_src)
-    dst = _fix_last_symbol(dst, post_src, align_trailing_period=config.align_trailing_period)
+    dst = _fix_last_symbol(
+        dst,
+        post_src,
+        align_trailing_period=config.align_trailing_period,
+        protected_post_src=protected_post_src,
+    )
 
     if post_dict is not None and post_dict.rules:
         dst = post_dict.apply(
@@ -413,10 +443,18 @@ def normalize_and_restore_dst(
         )
 
     dst = _fix_inner_punctuation_and_quotes(dst, post_src)
-    dst = _fix_last_symbol(dst, post_src, align_trailing_period=config.align_trailing_period)
+    dst = _fix_last_symbol(
+        dst,
+        post_src,
+        align_trailing_period=config.align_trailing_period,
+        protected_post_src=protected_post_src,
+    )
 
     if token_map:
         dst, _ = TextPreserver.restore_text(dst, token_map)
+
+    if config.use_post_dict_in_name and post_dict is not None and post_dict.rules and item.speaker_dst:
+        item.speaker_dst = post_dict.apply(item.speaker_dst, item, preserver=preserver)
 
     # Inline linebreak count alignment using post_src as the single authoritative baseline
     if config.extra_linebreak_policy == "trim":

@@ -1,23 +1,23 @@
-# `gal_framework` (v2.0) — Universal Visual Novel / Galgame Localization Middleware
+# `gal_framework` (v2.1) — Universal Visual Novel / Galgame Localization Middleware
 
 `gal_framework` 是一套**纯 Python 标准库实现（零外部依赖）、采用 `gt_input` / `transl_cache` / `gt_output` 物理三分离原子账本**、专为本地 AI Agent 高并发省流流水线打造的通用视觉小说 / Galgame 本地化中台框架。
 
 ---
 
-## 核心特性 (v2.0)
+## 核心特性 (v2.1)
 
-- **物理三分离原子账本与 `O(1)` 增量落盘 (`core/cache_ledger.py` + `core/rebuilder.py`)**
+- **物理三分离原子账本、跨进程锁与 `O(1)` 增量落盘 (`core/cache_ledger.py` + `core/rebuilder.py`)**
   - `gt_input/*.json`（只读原文）、`transl_cache/*.json`（裸初译 `pre_dst` / 二轮校对 `proofread_dst` / 预览 `post_dst_preview` / 上下文校验键）与 `gt_output/*.json`（成品交付）严格物理隔离。
-  - Windows 安全原子写入（`.json.tmp` -> `os.replace()`）+ `cache_history.jsonl` 全量变更审计与按 `task_id` 一键 `revert` 回滚。
-  - `rebuild` 零大模型成本全书重建：修改译后条件字典或人名映射后，秒级重刷全书缓存与输出。
+  - Windows/POSIX 双端跨线程/跨进程可重入文件锁（`file_lock`）+ 唯一临时文件原子落盘（`PID.TID.UUID.tmp` -> `os.replace()` 退避重试），支持多 Worker 安全并发推拉；附带 `cache_history.jsonl` 全量审计与按 `task_id` 逆序一键回滚。
+  - `rebuild` 零大模型成本全书重建：修改译后条件字典或人名映射后秒级重刷全书缓存与输出，并完整保留 `post_src_changed` 重翻标记。
   - `push_batch` 与 `edit_cache` 按目标文件 `O(1)` 选择性加载与差集重检，百文件级商业大作毫秒级响应。
 - **高密度省流工作包协议与断路器一步连招 (`core/batcher.py`)**
   - **`--session <id>` 记忆去重锁**：首锅注入完整 `<project_bible>` 底色卡，同会话后续批次自动缩减为 2 行 `BibleHash` 指纹提醒（若中途修改底色卡则哈希变化自动重发），消除多轮重复上下文膨胀。
   - **按文件分组极简协议**：支持 `## @file: <name>` 分组输入与 `@@ file: <name>` + `<id>|<译文>` 单行补丁提交（同时 100% 兼容传统 `@@ file|id` + `+译文`、JSON 数组与 JSONL），直接削减 60%~75% I/O Token。
-  - **带硬错误/软告警双熔断的 `batch-push --pull-next`**：`0` 硬错误且单锅软告警未超标时一步返回下一锅未译文本；一旦检出硬错误或单锅软告警飙升（`>8%`），立即熔断刹车，仅吐回问题条目要求原地修绿。
-- **确定性剥壳/扣壳与全程控制符保护 (`core/normalizer.py` + `core/text_preserve.py`)**
+  - **带防绕过熔断的 `batch-push --pull-next`**：`0` 硬错误且单锅软告警未超标时一步返回下一锅未译文本；一旦检出硬错误或软告警飙升（`>8%`），立即熔断刹车（含 GBK 非法字符防崩延迟导出与跨轮未修债追踪），仅吐回问题条目要求原地修绿。
+- **确定性剥壳/扣壳与 PUA 私用区控制符保护 (`core/normalizer.py` + `core/text_preserve.py`)**
   - 幂等剥离外层空白/换行及单行、嵌套、跨 2~3 条目连续对话引号（`「…」`/`『…』`）。
-  - `protect_text(include_ruby=True)` 全程罩住译后字典与标点对齐（句尾句号削齐、`♪`/`！？` 补回、`…。->…`、单对同向引号纠偏）。
+  - 采用 Unicode 私用区（PUA）无碰撞哨兵编码，`protect_text(include_ruby=True)` 全程免疫任意译后字典误改并罩住标点对齐（支持句尾控制符前标点对齐）。
   - 内置 `base` / `kag` / `scn_m2` / `renpy` / `rpgmaker` / `wolf` 六套安全控制符预设，支持 `translate` / `verbatim` / `flexible` 三种 Ruby 注音模式。
 - **三级条件字典与单字人名构词防误伤 (`core/dictionary.py` + `core/glossary_tools.py`)**
   - 完整支持 `pre_dict`、`gpt_dict`、`post_dict` 前缀修饰（`^^` 句首、`1^` 仅首现）与条件语法（`pre_jp`/`post_jp`/`pre_dst` + `[and]`/`[or]`/`!` + `(同上)`）。

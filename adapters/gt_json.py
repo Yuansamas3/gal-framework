@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Sequence
 
-from core.models import SentenceItem
+from core.models import SentenceItem, atomic_write_text
+
+_INTERNAL_EXPORT_KEYS = frozenset({"_name_key", "_cached_post_src", "_message_is_null"})
 
 
 def import_file(file_path: Path, rel_name: str) -> tuple[str, dict[str, Any], list[SentenceItem]]:
@@ -19,21 +22,34 @@ def import_file(file_path: Path, rel_name: str) -> tuple[str, dict[str, Any], li
     for idx, row in enumerate(raw, start=1):
         if not isinstance(row, dict):
             continue
-        message = str(row.get("message", ""))
+        raw_msg = row.get("message", "")
         extra = {k: v for k, v in row.items() if k not in ("name", "names", "message")}
+        if raw_msg is None:
+            message = ""
+            extra["_message_is_null"] = True
+        else:
+            message = str(raw_msg)
 
         if "names" in row:
             raw_names = row["names"]
             if isinstance(raw_names, list):
-                speakers_raw: Any = [str(n) for n in raw_names]
+                speakers_raw: Any = [None if n is None else str(n) for n in raw_names]
                 speaker = "、".join(n for n in speakers_raw if n)
+            elif raw_names is None:
+                speakers_raw = None
+                speaker = ""
             else:
                 speakers_raw = str(raw_names)
                 speaker = speakers_raw
             extra["_name_key"] = "names"
         elif "name" in row:
-            speakers_raw = str(row["name"])
-            speaker = speakers_raw
+            raw_name = row["name"]
+            if raw_name is None:
+                speakers_raw = None
+                speaker = ""
+            else:
+                speakers_raw = str(raw_name)
+                speaker = speakers_raw
             extra["_name_key"] = "name"
         else:
             speakers_raw = ""
@@ -74,10 +90,17 @@ def _resolve_speaker_output(
     speaker_map: dict[str, str],
 ) -> Any:
     raw = item.speakers_raw
+    if raw is None:
+        return item.speaker_dst if item.speaker_dst else None
     if isinstance(raw, list):
-        if item.speaker_dst and len(raw) == 1:
+        if item.speaker_dst:
+            if len(raw) == 1:
+                return [item.speaker_dst]
+            split_parts = [p.strip() for p in re.split(r"[、·・]", item.speaker_dst) if p.strip()]
+            if len(split_parts) == len(raw):
+                return split_parts
             return [item.speaker_dst]
-        return [speaker_map.get(n, n) for n in raw]
+        return [None if n is None else speaker_map.get(n, n) for n in raw]
     if isinstance(raw, str) and raw:
         return item.speaker_dst or speaker_map.get(raw, raw)
     return raw
@@ -104,12 +127,18 @@ def export_file(
         elif name_key == "name":
             row["name"] = _resolve_speaker_output(it, spk_map)
 
-        row["message"] = it.post_dst if it.post_dst != "" else it.pre_src
+        if it.post_dst != "":
+            row["message"] = it.post_dst
+        elif it.extra.get("_message_is_null"):
+            row["message"] = None
+        else:
+            row["message"] = it.pre_src
+
         if with_src:
-            row["ori_message"] = it.pre_src
+            row["ori_message"] = None if it.extra.get("_message_is_null") else it.pre_src
 
         for k, v in it.extra.items():
-            if k == "_name_key":
+            if k in _INTERNAL_EXPORT_KEYS:
                 continue
             if k not in row:
                 row[k] = v
@@ -117,9 +146,6 @@ def export_file(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     enc = "gbk" if encoding.lower() in ("gbk", "gb2312", "cp936") else "utf-8"
-    output_path.write_text(
-        json.dumps(out_rows, ensure_ascii=False, indent=2) + "\n",
-        encoding=enc,
-        errors="strict",
-    )
+    rendered = json.dumps(out_rows, ensure_ascii=False, indent=2) + "\n"
+    atomic_write_text(output_path, rendered, encoding=enc, errors="strict")
     return output_path

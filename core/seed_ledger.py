@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from .models import ItemStatus, SentenceItem
+from .models import ItemStatus, SentenceItem, atomic_write_json, file_lock
 
 
 def _utc_now() -> str:
@@ -46,9 +46,8 @@ class SeedLedger:
             "seeds": self.seeds,
             "samples": self.samples,
         }
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(self.path)
+        with file_lock(self.path.with_suffix(".lock")):
+            atomic_write_json(self.path, payload)
         return self.path
 
     def all_seeds(self) -> list[dict[str, Any]]:
@@ -312,15 +311,24 @@ class SeedLedger:
             reasons.append(
                 f"insufficient real dispersed samples ({len(valid_samples)} < {self.min_required_rounds})"
             )
-        elif valid_samples:
-            last_sample = valid_samples[-1]
-            last_regions = int(last_sample.get("regions", 0))
-            corpus_size = int(last_sample.get("totalTranslatedAtSample", 3))
-            required_regions = min(3, max(1, corpus_size))
-            if last_regions < required_regions:
+        else:
+            sampled_rounds = {int(s.get("round", 0)) for s in valid_samples}
+            missing_rounds = [
+                r for r in range(1, self.min_required_rounds + 1) if r not in sampled_rounds
+            ]
+            if missing_rounds:
                 reasons.append(
-                    f"latest sample covered only {last_regions} region(s) (< {required_regions} required)"
+                    f"missing real dispersed sample(s) for round(s): {missing_rounds}"
                 )
+            if valid_samples:
+                last_sample = valid_samples[-1]
+                last_regions = int(last_sample.get("regions", 0))
+                corpus_size = int(last_sample.get("totalTranslatedAtSample", 3))
+                required_regions = min(3, max(1, corpus_size))
+                if last_regions < required_regions:
+                    reasons.append(
+                        f"latest sample covered only {last_regions} region(s) (< {required_regions} required)"
+                    )
 
         return len(reasons) == 0, reasons
 

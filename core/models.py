@@ -4,10 +4,129 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
+import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+_THREAD_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_THREAD_HELD = threading.local()
+
+
+def _get_thread_lock(lock_key: str) -> threading.RLock:
+    with _THREAD_LOCKS_GUARD:
+        lk = _THREAD_LOCKS.get(lock_key)
+        if lk is None:
+            lk = threading.RLock()
+            _THREAD_LOCKS[lock_key] = lk
+        return lk
+
+
+@contextmanager
+def file_lock(lock_path: Path, *, timeout: float = 15.0, poll_interval: float = 0.01) -> Iterator[None]:
+    """Cross-thread and cross-process re-entrant advisory file lock (Windows msvcrt / POSIX fcntl)."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    key = str(lock_path.resolve()).lower() if os.name == "nt" else str(lock_path.resolve())
+    held: set[str] = getattr(_THREAD_HELD, "keys", None)
+    if held is None:
+        held = set()
+        _THREAD_HELD.keys = held
+    if key in held:
+        yield
+        return
+
+    tlock = _get_thread_lock(key)
+    deadline = time.monotonic() + max(0.1, timeout)
+
+    with tlock:
+        fh = open(lock_path, "a+b")
+        locked = False
+        try:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            while True:
+                try:
+                    if os.name == "nt":
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Timed out acquiring file lock: {lock_path}")
+                    time.sleep(poll_interval)
+            held.add(key)
+            yield
+        finally:
+            held.discard(key)
+            if locked:
+                try:
+                    if os.name == "nt":
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            fh.close()
+
+
+def atomic_write_text(
+    target_path: Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+    errors: str = "strict",
+    retries: int = 15,
+) -> Path:
+    """Windows-safe atomic write using a PID/thread/UUID-unique temp file and os.replace retry."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    # Encode in memory first so UnicodeEncodeError fails cleanly before touching disk
+    encoded = content.encode(encoding, errors=errors)
+    uniq = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
+    temp_path = target_path.with_name(f"{target_path.name}.{uniq}.tmp")
+    try:
+        temp_path.write_bytes(encoded)
+        last_exc: OSError | None = None
+        for attempt in range(max(1, retries)):
+            try:
+                os.replace(temp_path, target_path)
+                last_exc = None
+                break
+            except PermissionError as exc:
+                last_exc = exc
+                time.sleep(min(0.05, 0.005 * (attempt + 1)))
+        if last_exc is not None:
+            raise last_exc
+    except Exception:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        raise
+    return target_path
+
+
+def atomic_write_json(target_path: Path, data: Any) -> Path:
+    """Windows-safe atomic JSON write with unique temp file and os.replace retry."""
+    rendered = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    return atomic_write_text(target_path, rendered, encoding="utf-8", errors="strict")
 
 
 def get_framework_root() -> Path:
@@ -251,7 +370,6 @@ class ProjectConfig:
     use_post_dict_in_name: bool = False
     pre_dicts: list[str] = field(
         default_factory=lambda: [
-            "builtin:pre_h_phonetic.tsv",
             "builtin:pre_common.tsv",
             "project:项目字典_译前.tsv",
         ]
@@ -446,10 +564,7 @@ class ProjectConfig:
         root = Path(project_dir)
         root.mkdir(parents=True, exist_ok=True)
         path = self.config_file_path(root)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        tmp_path.write_text(
-            json.dumps(self.to_dict(), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        tmp_path.replace(path)
+        lock_path = root / "work" / ".config.lock"
+        with file_lock(lock_path):
+            atomic_write_json(path, self.to_dict())
         return path
